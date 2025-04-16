@@ -1,8 +1,12 @@
 import weakref
+import logging
 
 import tqdm
 import torch
 import torch.nn.functional as F
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ForwardPassEarlyStop(Exception):
@@ -13,7 +17,7 @@ class QuantConfig:
     def __init__(
         self,
         num_bits: int = 4,
-        symmetric: bool = True,
+        zero_point: bool = True,
         group_size: int = 128,
     ):
         assert group_size > 0
@@ -21,14 +25,17 @@ class QuantConfig:
 
         self.num_bits = num_bits
         self.group_size = group_size
-        self.symmetric = symmetric
+        self.zero_point = zero_point
 
-        if self.symmetric:
+        if self.zero_point:
             self.min_int = 0
             self.max_int = 2**self.num_bits - 1
         else:
             self.min_int = -(2 ** (self.num_bits - 1))
             self.max_int = 2 ** (self.num_bits - 1) - 1
+
+    def __repr__(self):
+        return f"QuantConfig(num_bits={self.num_bits}, zero_point={self.zero_point}, group_size={self.group_size})"
 
     @torch.inference_mode()
     def quantize_tensor(self, x: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor):
@@ -47,26 +54,49 @@ class QuantConfig:
 
         x = x.reshape(-1, self.group_size)
 
-        if self.symmetric:
-            min_val = x.amin(dim=1, keepdim=True)
-            max_val = x.amax(dim=1, keepdim=True)
+        if self.zero_point:
+            min_val = x.amin(dim=1, keepdim=True).broadcast_to(-1, self.group_size)
+            max_val = x.amax(dim=1, keepdim=True).broadcast_to(-1, self.group_size)
             scale = (max_val - min_val) / self.max_int
             zero = (-torch.round(min_val / scale)).clamp(self.min_int, self.max_int)
         else:
-            max_val = x.abs().amax(dim=1, keepdim=True)
+            max_val = (
+                x.abs().amax(dim=1, keepdim=True).broadcast_to(-1, self.group_size)
+            )
             scale = max_val / self.max_int
             zero = torch.zeros_like(max_val)
 
         return scale.reshape(shape), zero.reshape(shape)
 
 
-class GraphTracer(torch.nn.Module):
+class GraphTracer:
     graph: torch.nn.Module
     weakref_to_module_name: dict[weakref.ReferenceType, str]
 
     @classmethod
-    def set_graph(cls, graph: torch.nn.Module):
+    def init_hooks(cls, graph: torch.nn.Module):
+        for name, module in graph.named_modules():
+            if len(name) == 0:
+                continue
+
+            def make_hook(n):
+                def hook(module, args, output):
+                    if isinstance(output, tuple):
+                        for o in output:
+                            if o is None:
+                                continue
+                            assert isinstance(o, torch.Tensor), type(o)
+                            GraphTracer.weakref_to_module_name[weakref.ref(o)] = n
+                    else:
+                        assert isinstance(output, torch.Tensor), type(output)
+                        GraphTracer.weakref_to_module_name[weakref.ref(output)] = n
+
+                return hook
+
+            module.register_forward_hook(make_hook(name))
+
         cls.graph = graph
+        cls.weakref_to_module_name = {}
 
     @classmethod
     def clear(cls):
@@ -75,20 +105,10 @@ class GraphTracer(torch.nn.Module):
     @classmethod
     def get_parent(cls, x: torch.Tensor) -> torch.nn.Module:
         name = cls.weakref_to_module_name[weakref.ref(x)]
-        return getattr(cls.graph, name)
-
-    def __init__(self, name: str, module: torch.nn.Module):
-        super().__init__()
-        self.name = name
-        self.module = module
-
-    def forward(self, *args, **kwargs):
-        output = self.module(*args, **kwargs)
-        self.weakref_to_module_name[weakref.ref(output)] = self.name
-        return output
+        return name, cls.graph.get_submodule(name)
 
 
-class LinearQuantizer(torch.nn.Module):
+class LinearQuantizer:
     def __init__(
         self,
         qcfg: QuantConfig,
@@ -106,8 +126,11 @@ class LinearQuantizer(torch.nn.Module):
         self.storage_device = storage_device
         self.out_dim, self.inp_dim = self.module.weight.shape
 
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
+    def pre_forward_hook(self, *args, **kwargs):
+        pass
+
+    def post_forward_hook(self, *args, **kwargs):
+        pass
 
     def quantize_module(self):
         raise NotImplementedError()
@@ -115,7 +138,6 @@ class LinearQuantizer(torch.nn.Module):
     @classmethod
     def get_transformers_quant_config(cls, qcfg: QuantConfig) -> dict:
         raise NotImplementedError()
-
 
 
 class AWQ(LinearQuantizer):
@@ -131,16 +153,23 @@ class AWQ(LinearQuantizer):
         name: str,
         module: torch.nn.Linear,
         execution_device: torch.device,
-        cache_device: torch.device,
+        storage_device: torch.device,
         search_grid_size: int = 20,
     ):
-        super().__init__(qcfg, name, module, execution_device, cache_device)
+        super().__init__(qcfg, name, module, execution_device, storage_device)
         self.search_grid_size = search_grid_size
         self.xs: list[torch.Tensor] = []
+        self.parent = None
 
-    @torch.inference_mode()
-    def forward(self, x: torch.Tensor):
-        self.xs.append(x.to(self.storage_device))
+    def pre_forward_hook(self, module, args):
+        assert self.module == module
+        assert isinstance(args, tuple) and len(args) == 1
+        x = args[0]
+        assert isinstance(x, torch.Tensor)
+        if self.parent is None:
+            parent_name, self.parent = GraphTracer.get_parent(x)
+            LOGGER.debug(f"Found parent layer {parent_name} {self.parent}")
+        self.xs.append(x.to(self.storage_device).reshape(-1, self.inp_dim))
         raise ForwardPassEarlyStop()
 
     @torch.inference_mode()
@@ -148,11 +177,14 @@ class AWQ(LinearQuantizer):
         assert self.inp_dim % self.qcfg.group_size == 0
 
         total_batch_size = sum(x.shape[0] for x in self.xs)
+        assert total_batch_size > 0
 
         w = self.module.weight.to(self.execution_device)
         b = None
         if self.module.bias is not None:
             b = self.module.bias.to(self.execution_device)
+
+        # TODO filter out padded!!!
 
         s_x: torch.Tensor = 0
         for x in self.xs:
@@ -167,11 +199,10 @@ class AWQ(LinearQuantizer):
         best_loss = float("inf")
         best_s = None
         best_alpha = None
-        for alpha in tqdm.tqdm(
-            torch.linspace(0, 1, steps=self.search_grid_size + 1),
-            leave=False,
-            desc="Searching scales",
-        ):
+        pbar = tqdm.tqdm(
+            total=self.search_grid_size + 1, leave=False, desc="Searching scales"
+        )
+        for alpha in torch.linspace(0, 1, steps=self.search_grid_size + 1):
             s = s_x.pow(alpha).clamp(min=1e-8)
             s[torch.isinf(s) | torch.isnan(s)] = 1
 
@@ -192,30 +223,35 @@ class AWQ(LinearQuantizer):
                 best_s = s.to(self.storage_device)
                 best_alpha = alpha
 
+            pbar.set_description(
+                f"Searching scales: loss@{best_loss:.5f} alpha@{best_alpha:.3f}",
+                refresh=False,
+            )
+            pbar.update()
+
         # Apply scale to module
         self.module.weight.mul_(best_s.view(1, -1))
 
         # Apply scale to parent op
-        parent = GraphTracer.get_parent(self.xs[0])
-        parent_op_name = parent.__class__.__name__.lower()
-        if isinstance(parent, torch.nn.Linear):
-            parent.weight.div_(best_s.view(-1, 1))
-            if parent.bias is not None:
-                parent.bias.div_(best_s)
+        parent_op_name = self.parent.__class__.__name__.lower()
+        if isinstance(self.parent, torch.nn.Linear):
+            self.parent.weight.div_(best_s.view(-1, 1))
+            if self.parent.bias is not None:
+                self.parent.bias.div_(best_s)
 
         elif "norm" in parent_op_name:
-            assert hasattr(parent, "weight")
+            assert hasattr(self.parent, "weight")
             if "gemma" in parent_op_name:
-                parent.weight += 1
-                parent.weight.div_(best_s)
-                parent.weight -= 1
+                self.parent.weight += 1
+                self.parent.weight.div_(best_s)
+                self.parent.weight -= 1
             else:
-                parent.weight.div_(best_s)
-            if hasattr(parent, "bias") and parent.bias is not None:
-                parent.bias.div_(best_s)
+                self.parent.weight.div_(best_s)
+            if hasattr(self.parent, "bias") and self.parent.bias is not None:
+                self.parent.bias.div_(best_s)
 
         else:
-            raise NotImplementedError(f"Can't rescale previous op {parent}")
+            raise NotImplementedError(f"Can't rescale previous op {self.parent}")
 
         # # Search for best clip
         # apply_clip = not any(
@@ -232,10 +268,9 @@ class AWQ(LinearQuantizer):
     def get_transformers_quant_config(cls, qcfg: QuantConfig) -> dict:
         return {
             "quant_method": "awq",
-            "zero_point": qcfg.symmetric,
+            "zero_point": qcfg.zero_point,
             "group_size": qcfg.group_size,
             "bits": qcfg.num_bits,
             "version": "gemm",
             "modules_to_not_convert": None,
         }
-

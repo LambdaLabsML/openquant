@@ -6,13 +6,19 @@ import tqdm
 import torch
 import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM, default_data_collator
+from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.modeling_utils import PreTrainedModel
 from accelerate import cpu_offload
 
-from openquant import LinearQuantizer, AWQ, QuantConfig, GraphTracer,ForwardPassEarlyStop
+from openquant import (
+    LinearQuantizer,
+    AWQ,
+    QuantConfig,
+    GraphTracer,
+    ForwardPassEarlyStop,
+)
 
 LOGGER = logging.getLogger(__name__)
-
 
 
 @torch.inference_mode()
@@ -23,6 +29,7 @@ def main():
     parser.add_argument(
         "-q",
         "--quantization",
+        default=None,
         choices=[
             "AWQ-Int4",
             "GPTQ-Int8",
@@ -69,6 +76,7 @@ def main():
         type=int,
         help="Number of calibration samples to process at the same time.",
     )
+    parser.add_argument("--cpu-offload", default=False, action="store_true")
     args = parser.parse_args()
 
     model_name = os.path.basename(args.model)
@@ -86,9 +94,11 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    LOGGER.info(f"Saving quantized model to {quant_name}")
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     def preprocess(example):
         return {
@@ -98,7 +108,7 @@ def main():
     def tokenize(sample):
         return tokenizer(
             sample["text"],
-            padding=False,
+            padding="max_length",
             max_length=args.seq_length,
             truncation=True,
             add_special_tokens=False,
@@ -121,10 +131,16 @@ def main():
         attn_implementation = None
         LOGGER.info(f"`import flash_attn` not found, pip install to use")
 
-    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        args.model, attn_implementation=attn_implementation
-    )
-    cpu_offload(model, execution_device=device)
+    if args.cpu_offload:
+        model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+            args.model, attn_implementation=attn_implementation
+        )
+        cpu_offload(model, execution_device=device)
+    else:
+        with device:
+            model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+                args.model, attn_implementation=attn_implementation
+            )
 
     quant_cls: type[LinearQuantizer]
     if args.quantization == "AWQ-Int4":
@@ -152,34 +168,33 @@ def main():
         raise NotImplementedError(args.quantization)
 
     LOGGER.info(
-        f"Using QuantConfig(num_bits={quant_config.num_bits}). Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
+        f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
     )
 
     LOGGER.info("Setting up graph tracing")
-    for name, module in model.named_modules():
-        setattr(model, name, GraphTracer(name, module))
+    GraphTracer.init_hooks(model)
 
-    target_modules = {}
+    target_modules: dict[str, torch.nn.Module] = {}
     for name, module in model.named_modules():
-        assert isinstance(module, GraphTracer)
-        module = module.module
         if isinstance(module, torch.nn.Linear):
             LOGGER.debug(f"Targeting {name}")
             target_modules[name] = module
 
     pbar = tqdm.tqdm(total=len(target_modules))
     for name, module in target_modules.items():
+        assert len(name) > 0
         assert not isinstance(module, GraphTracer)
 
-        pbar.set_description(name)
+        pbar.set_description(f"Quantizing {name}")
 
         quantizer: LinearQuantizer = quant_cls(
             quant_config,
+            name,
             module,
             execution_device=device,
             storage_device=torch.device("cpu"),
         )
-        setattr(model, name, quantizer)
+        module.register_forward_pre_hook(quantizer.pre_forward_hook)
 
         GraphTracer.clear()
 
@@ -189,17 +204,19 @@ def main():
         ):
             uncollated_batch = ds[i : i + args.batch_size]
             collated_batch = default_data_collator(uncollated_batch)
-            model_inputs = model.prepare_inputs_for_generation(collated_batch)
+            model_inputs = model.prepare_inputs_for_generation(**collated_batch)
             try:
-                _ = model.generate(model_inputs, max_new_tokens=1)
+                _ = model(**model_inputs)
             except ForwardPassEarlyStop:
                 pass
 
         # do quantization
         # TODO do we have to re-wrap this with GraphTracer?
         quantized_module = quantizer.quantize_module()
+        assert quantized_module is not None
         setattr(model, name, quantized_module)
 
+    LOGGER.info(f"Saving quantized model to {quant_name}")
     model.config.quantization_config = quant_cls.get_transformers_quant_config(
         quant_config
     )
