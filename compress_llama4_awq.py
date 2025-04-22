@@ -1,3 +1,100 @@
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4ForConditionalGeneration,
+    Llama4TextDecoderLayer,
+    Llama4TextMoe,
+    Llama4TextMLP,
+    Llama4VisionEncoderLayer,
+)
+
+
+def awq_plan(model: Llama4ForConditionalGeneration):
+    assert isinstance(model, Llama4ForConditionalGeneration)
+    plan = []
+
+    # encoder: Llama4VisionEncoderLayer
+    # for encoder in model.vision_model.model.layers:
+    #     plan.append(
+    #         dict(
+    #             inverse_scale=encoder.input_layernorm,
+    #             scale=[
+    #                 encoder.self_attn.q_proj,
+    #                 encoder.self_attn.k_proj,
+    #                 encoder.self_attn.v_proj,
+    #             ],
+    #         )
+    #     )
+    #     plan.append(
+    #         dict(
+    #             inverse_scale=encoder.self_attn.v_proj,
+    #             scale=[encoder.self_attn.o_proj],
+    #         )
+    #     )
+    #     plan.append(
+    #         dict(
+    #             inverse_scale=encoder.post_attention_layernorm,
+    #             scale=[encoder.mlp.fc1],
+    #         )
+    #     )
+    #     plan.append(
+    #         dict(
+    #             # TODO there is a GELU activation after fc1 & before fc2,
+    #             # which is roughly x * Phi(x), which I think means we scale the output of fc1?
+    #             inverse_scale=encoder.mlp.fc1,
+    #             scale=[encoder.mlp.fc2],
+    #         )
+    #     )
+
+    # text model
+    decoder: Llama4TextDecoderLayer
+    for decoder in model.language_model.model.layers:
+        plan.append(
+            dict(
+                inverse_scale=decoder.input_layernorm,
+                scale=[
+                    decoder.self_attn.q_proj,
+                    decoder.self_attn.k_proj,
+                    decoder.self_attn.v_proj,
+                ],
+            )
+        )
+        plan.append(
+            dict(
+                inverse_scale=decoder.self_attn.v_proj,
+                scale=[decoder.self_attn.o_proj],
+            )
+        )
+        if decoder.is_moe_layer:
+            assert isinstance(decoder.feed_forward, Llama4TextMoe)
+            # NOTE: NOT quantizing experts yet
+            plan.append(
+                dict(
+                    inverse_scale=decoder.post_attention_layernorm,
+                    scale=[
+                        decoder.feed_forward.shared_expert,
+                        decoder.feed_forward.router,
+                    ],
+                )
+            )
+        else:
+            assert isinstance(decoder.feed_forward, Llama4TextMLP)
+            plan.append(
+                dict(
+                    inverse_scale=decoder.post_attention_layernorm,
+                    scale=[
+                        decoder.feed_forward.gate_proj,
+                        decoder.feed_forward.up_proj,
+                    ],
+                )
+            )
+
+            plan.append(
+                dict(
+                    inverse_scale=decoder.feed_forward.up_proj,
+                    scale=[decoder.feed_forward.down_proj],
+                )
+            )
+
+
 import argparse
 import os
 import logging
@@ -11,10 +108,8 @@ from transformers.modeling_utils import PreTrainedModel
 from accelerate import cpu_offload
 
 from openquant import (
-    LinearQuantizer,
     AWQ,
     QuantConfig,
-    GraphTracer,
     ForwardPassEarlyStop,
 )
 
@@ -27,24 +122,9 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
-        "-q",
-        "--quantization",
-        default=None,
-        choices=[
-            "AWQ-Int4",
-            "GPTQ-Int8",
-            "GPTQ-Int4",
-            "Static-F8",
-            "Dynamic-F8",
-        ],
-        required=True,
-        help="The type of quantization to apply",
-    )
-    parser.add_argument(
         "-m",
         "--model",
-        default=None,
-        required=True,
+        default="meta-llama/Llama-4-Scout-17B-16E-Instruct",
         help="The base model. Should be huggingface tag.",
     )
     parser.add_argument(
@@ -80,7 +160,7 @@ def main():
     args = parser.parse_args()
 
     model_name = os.path.basename(args.model)
-    quant_name = f"{model_name}-{args.quantization}"
+    quant_name = f"{model_name}-AWQ-Int4"
 
     logging.basicConfig(level=logging.INFO)
 
@@ -142,73 +222,31 @@ def main():
                 args.model, attn_implementation=attn_implementation
             )
 
-    quant_cls: type[LinearQuantizer]
-    if args.quantization == "AWQ-Int4":
-        quant_config = QuantConfig(num_bits=4)
-        quant_cls = AWQ
-    # elif args.quantization == "GPTQ-Int4":
-    #     quant_config = QuantConfig(num_bits=4)
-    #     quant_cls = GPTQ
-    # elif args.quantization == "GPTQ-Int8":
-    #     quant_config = QuantConfig(num_bits=8)
-    #     quant_cls = GPTQ
-    # elif args.quantization == "Dynamic-F8":
-    #     quant_config = QuantConfig(num_bits=8)
-    #     quant_cls = DynamicFloat
-    # elif args.quantization == "Static-F8":
-    #     quant_config = QuantConfig(num_bits=8)
-    #     quant_cls = StaticFloat
-    # elif args.quantization == "Dynamic-F4":
-    #     quant_config = QuantConfig(num_bits=4)
-    #     quant_cls = DynamicFloat
-    # elif args.quantization == "Static-F4":
-    #     quant_config = QuantConfig(num_bits=4)
-    #     quant_cls = StaticFloat
-    else:
-        raise NotImplementedError(args.quantization)
+    quant_config = QuantConfig(num_bits=4)
 
     LOGGER.info(
         f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
     )
 
-    LOGGER.info("Setting up graph tracing")
-    GraphTracer.init_hooks(model)
-    _ = model(**model.prepare_inputs_for_generation(**default_data_collator(ds[0:1])))
-
-    included = set()
-    plan = []
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear) and name not in included:
-            if name in GraphTracer.parent:
-                parent_name = GraphTracer.parent[name]
-                siblings = GraphTracer.children[parent_name]
-                assert name in siblings
-                plan.append((parent_name, siblings))
-                included.update(siblings)
-            else:
-                plan.append((None))
-            LOGGER.info(f"Targeting {siblings} (input from {parent_name})")
-
-    assert False
+    plan = awq_plan(model)
 
     pbar = tqdm.tqdm(total=len(plan))
-    for prev_op, targets in plan.items():
-        pbar.set_description(f"Quantizing {targets}")
+    for target in plan.items():
+        pbar.set_description(f"Quantizing {target}")
 
-        quantizer: LinearQuantizer = quant_cls(
+        quantizer = AWQ(
             quant_config,
-            name,
-            module,
+            module_to_inverse_scale=target["inverse_scale"],
+            modules_to_scale=target["scale"],
             execution_device=device,
             storage_device=torch.device("cpu"),
         )
-        module.register_forward_pre_hook(quantizer.pre_forward_hook)
-
-        GraphTracer.clear()
+        for m in quantizer.modules_to_scale:
+            m.register_forward_pre_hook(quantizer.pre_forward_hook)
 
         # calibrate
         for i in tqdm.tqdm(
-            range(0, len(ds), args.batch_size), leave=False, desc="Fwd Pass Calibration"
+            range(0, len(ds), args.batch_size), leave=False, desc="Calibrating"
         ):
             uncollated_batch = ds[i : i + args.batch_size]
             collated_batch = default_data_collator(uncollated_batch)
@@ -219,15 +257,14 @@ def main():
                 pass
 
         # do quantization
-        # TODO do we have to re-wrap this with GraphTracer?
         quantized_module = quantizer.quantize_module()
         assert quantized_module is not None
         setattr(model, name, quantized_module)
 
+        pbar.update()
+
     LOGGER.info(f"Saving quantized model to {quant_name}")
-    model.config.quantization_config = quant_cls.get_transformers_quant_config(
-        quant_config
-    )
+    model.config.quantization_config = AWQ.get_transformers_quant_config(quant_config)
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
 

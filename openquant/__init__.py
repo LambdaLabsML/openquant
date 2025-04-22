@@ -69,78 +69,115 @@ class QuantConfig:
         return scale.reshape(shape), zero.reshape(shape)
 
 
-class GraphTracer:
-    graph: torch.nn.Module
-    weakref_to_module_name: dict[weakref.ReferenceType, str]
-
-    @classmethod
-    def init_hooks(cls, graph: torch.nn.Module):
-        for name, module in graph.named_modules():
-            if len(name) == 0:
-                continue
-
-            def make_hook(n):
-                def hook(module, args, output):
-                    if isinstance(output, tuple):
-                        for o in output:
-                            if o is None:
-                                continue
-                            assert isinstance(o, torch.Tensor), type(o)
-                            GraphTracer.weakref_to_module_name[weakref.ref(o)] = n
-                    else:
-                        assert isinstance(output, torch.Tensor), type(output)
-                        GraphTracer.weakref_to_module_name[weakref.ref(output)] = n
-
-                return hook
-
-            module.register_forward_hook(make_hook(name))
-
-        cls.graph = graph
-        cls.weakref_to_module_name = {}
-
-    @classmethod
-    def clear(cls):
-        cls.weakref_to_module_name.clear()
-
-    @classmethod
-    def get_parent(cls, x: torch.Tensor) -> torch.nn.Module:
-        name = cls.weakref_to_module_name[weakref.ref(x)]
-        return name, cls.graph.get_submodule(name)
+# def extract_tensors(obj) -> list[torch.Tensor]:
+#     tensors = []
+#     if obj is None:
+#         pass
+#     elif isinstance(obj, torch.Tensor):
+#         tensors.append(obj)
+#     elif isinstance(obj, tuple):
+#         for o in obj:
+#             tensors.extend(extract_tensors(o))
+#     elif isinstance(obj, dict):
+#         for k, v in obj.items():
+#             tensors.extend(extract_tensors(v))
+#     else:
+#         pass
+#     return tensors
 
 
-class LinearQuantizer:
-    def __init__(
-        self,
-        qcfg: QuantConfig,
-        name: str,
-        module: torch.nn.Linear,
-        execution_device: torch.device,
-        storage_device: torch.device,
-    ):
-        super().__init__()
-        assert isinstance(module, torch.nn.Linear)
-        self.qcfg = qcfg
-        self.name = name
-        self.module = module
-        self.execution_device = execution_device
-        self.storage_device = storage_device
-        self.out_dim, self.inp_dim = self.module.weight.shape
+# class GraphTracer:
+#     graph: torch.nn.Module
 
-    def pre_forward_hook(self, *args, **kwargs):
-        pass
+#     parent: dict[str, list[str]]
+#     children: dict[str, list[str]]
 
-    def post_forward_hook(self, *args, **kwargs):
-        pass
+#     output_to_module_name: dict[weakref.ReferenceType, str]
 
-    def quantize_module(self):
-        raise NotImplementedError()
+#     @classmethod
+#     def init_hooks(cls, graph: torch.nn.Module):
+#         for name, module in graph.named_modules():
+#             if len(name) == 0:
+#                 continue
 
-    @classmethod
-    def get_transformers_quant_config(cls, qcfg: QuantConfig) -> dict:
-        raise NotImplementedError()
+#             def make_pre_forward_hook(n):
+#                 def hook(module, args):
+#                     parents = []
+#                     for tensor in extract_tensors(args):
+#                         parent = GraphTracer.output_to_module_name.get(
+#                             weakref.ref(tensor)
+#                         )
+#                         if parent is not None:
+#                             parents.append(parent)
+
+#                     if len(parents) > 1:
+#                         raise NotImplementedError()
+#                     if len(parents) != 0:
+#                         GraphTracer.parent[n] = parents[0]
+#                         if parents[0] not in GraphTracer.children:
+#                             GraphTracer.children[parents[0]] = []
+#                         GraphTracer.children[parents[0]].append(n)
+
+#                 return hook
+
+#             def make_post_forward_hook(n):
+#                 def hook(module, args, output):
+#                     for tensor in extract_tensors(output):
+#                         GraphTracer.output_to_module_name[weakref.ref(tensor)] = n
+
+#                 return hook
+
+#             module.register_forward_pre_hook(make_pre_forward_hook(name))
+#             module.register_forward_hook(make_post_forward_hook(name))
+
+#         cls.parent = {}
+#         cls.children = {}
+#         cls.graph = graph
+#         cls.output_to_module_name = {}
+
+#     @classmethod
+#     def clear(cls):
+#         cls.output_to_module_name.clear()
+
+#     @classmethod
+#     def get_parent(cls, x: torch.Tensor) -> torch.nn.Module:
+#         name = cls.output_to_module_name[weakref.ref(x)]
+#         return name, cls.graph.get_submodule(name)
 
 
-class AWQ(LinearQuantizer):
+# class LinearQuantizer:
+#     def __init__(
+#         self,
+#         qcfg: QuantConfig,
+#         name: str,
+#         module: torch.nn.Linear,
+#         execution_device: torch.device,
+#         storage_device: torch.device,
+#     ):
+#         super().__init__()
+#         assert isinstance(module, torch.nn.Linear)
+#         self.qcfg = qcfg
+#         self.name = name
+#         self.module = module
+#         self.execution_device = execution_device
+#         self.storage_device = storage_device
+#         self.out_dim, self.inp_dim = self.module.weight.shape
+
+#     def pre_forward_hook(self, *args, **kwargs):
+#         pass
+
+#     def post_forward_hook(self, *args, **kwargs):
+#         pass
+
+#     def quantize_module(self):
+#         raise NotImplementedError()
+
+#     @classmethod
+#     def get_transformers_quant_config(cls, qcfg: QuantConfig) -> dict:
+#         raise NotImplementedError()
+
+
+class AWQ:
     """
     AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration
 
@@ -150,39 +187,51 @@ class AWQ(LinearQuantizer):
     def __init__(
         self,
         qcfg: QuantConfig,
-        name: str,
-        module: torch.nn.Linear,
+        module_to_inverse_scale: torch.nn.Module,
+        modules_to_scale: list[torch.nn.Linear],
         execution_device: torch.device,
         storage_device: torch.device,
         search_grid_size: int = 20,
     ):
-        super().__init__(qcfg, name, module, execution_device, storage_device)
+        if modules_to_scale[0].bias is not None:
+            assert all(m.bias is not None for m in modules_to_scale)
+        else:
+            assert all(m.bias is None for m in modules_to_scale)
+
+        self.qcfg = qcfg
+        self.module_to_inverse_scale = module_to_inverse_scale
+        self.modules_to_scale = modules_to_scale
+        self.execution_device = execution_device
+        self.storage_device = storage_device
         self.search_grid_size = search_grid_size
         self.xs: list[torch.Tensor] = []
-        self.parent = None
 
     def pre_forward_hook(self, module, args):
-        assert self.module == module
+        assert module in self.modules_to_scale
         assert isinstance(args, tuple) and len(args) == 1
         x = args[0]
         assert isinstance(x, torch.Tensor)
-        if self.parent is None:
-            parent_name, self.parent = GraphTracer.get_parent(x)
-            LOGGER.debug(f"Found parent layer {parent_name} {self.parent}")
         self.xs.append(x.to(self.storage_device).reshape(-1, self.inp_dim))
         raise ForwardPassEarlyStop()
 
     @torch.inference_mode()
     def quantize_module(self):
-        assert self.inp_dim % self.qcfg.group_size == 0
 
         total_batch_size = sum(x.shape[0] for x in self.xs)
         assert total_batch_size > 0
 
-        w = self.module.weight.to(self.execution_device)
+        _, inp_dim = self.modules_to_scale[0].shape
+        assert inp_dim % self.qcfg.group_size == 0
+        assert all(m.shape[1] == inp_dim for m in self.modules_to_scale)
+
+        w = torch.cat([m.weight for m in self.modules_to_scale]).to(
+            self.execution_device
+        )
         b = None
-        if self.module.bias is not None:
-            b = self.module.bias.to(self.execution_device)
+        if self.modules_to_scale[0][1].bias is not None:
+            b = torch.cat([m.bias for m in self.modules_to_scale]).to(
+                self.execution_device
+            )
 
         # TODO filter out padded!!!
 
@@ -193,7 +242,7 @@ class AWQ(LinearQuantizer):
             # NOTE: this is the group-wise functionality
             g_x = x.reshape(x.shape[0], -1, self.qcfg.group_size)
             s_x += g_x.abs().sum(0) / total_batch_size
-        s_x = s_x.reshape(self.inp_dim)
+        s_x = s_x.reshape(inp_dim)
 
         # Find best scale
         best_loss = float("inf")
@@ -206,14 +255,16 @@ class AWQ(LinearQuantizer):
             s = s_x.pow(alpha).clamp(min=1e-8)
             s[torch.isinf(s) | torch.isnan(s)] = 1
 
-            w_s = w * s
+            s_m = s.repeat(len(self.modules_to_scale))
+
+            w_s = w * s_m
             w_q = self.qcfg.quantize_tensor(w_s, *self.qcfg.compute_qparams(w_s))
 
             loss = 0
             for x in self.xs:
                 x = x.to(self.execution_device)
                 y = F.linear(x, w, bias=b)
-                y_q = F.linear(x / s, w_q, bias=b)
+                y_q = F.linear(x / s_m, w_q, bias=b)
                 loss += (y - y_q).float().square().sum() / (
                     total_batch_size * self.out_dim
                 )
@@ -230,39 +281,42 @@ class AWQ(LinearQuantizer):
             pbar.update()
 
         # Apply scale to module
-        self.module.weight.mul_(best_s.view(1, -1))
+        for module in self.modules_to_scale:
+            module.weight.mul(best_s.view(1, -1))
 
         # Apply scale to parent op
-        parent_op_name = self.parent.__class__.__name__.lower()
-        if isinstance(self.parent, torch.nn.Linear):
-            self.parent.weight.div_(best_s.view(-1, 1))
-            if self.parent.bias is not None:
-                self.parent.bias.div_(best_s)
+        parent = self.module_to_inverse_scale
+        parent_op_name = parent.__class__.__name__.lower()
+        if isinstance(parent, torch.nn.Linear):
+            parent.weight.div_(best_s.view(-1, 1))
+            if parent.bias is not None:
+                parent.bias.div_(best_s)
 
         elif "norm" in parent_op_name:
-            assert hasattr(self.parent, "weight")
+            assert hasattr(parent, "weight")
             if "gemma" in parent_op_name:
-                self.parent.weight += 1
-                self.parent.weight.div_(best_s)
-                self.parent.weight -= 1
+                parent.weight += 1
+                parent.weight.div_(best_s)
+                parent.weight -= 1
             else:
-                self.parent.weight.div_(best_s)
-            if hasattr(self.parent, "bias") and self.parent.bias is not None:
-                self.parent.bias.div_(best_s)
+                parent.weight.div_(best_s)
+            if hasattr(parent, "bias") and parent.bias is not None:
+                parent.bias.div_(best_s)
 
         else:
-            raise NotImplementedError(f"Can't rescale previous op {self.parent}")
+            raise NotImplementedError(f"Can't rescale previous op {parent}")
 
         # # Search for best clip
-        # apply_clip = not any(
-        #     p in self.name for p in ["q_", "k_", "query", "key", "Wqkv"]
-        # )
-        # for x in self.xs:
-        #     x.div_(best_s)
+        apply_clip = not any(
+            p in self.name for p in ["q_", "k_", "query", "key", "Wqkv"]
+        )
+        if apply_clip:
+            for x in self.xs:
+                x.div_(best_s)
 
-        # # TODO apply clip to module
+            raise NotImplementedError()
 
-        # raise NotImplementedError()
+        raise NotImplementedError()
 
     @classmethod
     def get_transformers_quant_config(cls, qcfg: QuantConfig) -> dict:
