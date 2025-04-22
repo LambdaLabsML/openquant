@@ -1,6 +1,7 @@
 import argparse
 import os
 import logging
+import gc
 
 import tqdm
 import torch
@@ -9,6 +10,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, default_data_colla
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.modeling_utils import PreTrainedModel
 from accelerate import cpu_offload
+from accelerate.hooks import remove_hook_from_module
 
 from openquant import (
     AWQ,
@@ -116,13 +118,9 @@ def main():
     LOGGER.info(f"Loading {args.model}")
     attn_impl = get_attn_implementation()
     
-    load_device = device if args.disable_cpu_offload else torch.device("cpu")
-    with load_device:
-        model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-            args.model, attn_implementation=attn_impl
-        )
-    if not args.disable_cpu_offload:
-        model = cpu_offload(model, execution_device=device)
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+        args.model, attn_implementation=attn_impl, torch_dtype="auto"
+    )
 
     plan = make_awq_plan(model)
     LOGGER.info(f"{len(plan)} quantization targets")
@@ -133,29 +131,47 @@ def main():
     for target in plan:
         pbar.set_description(f"Quantizing {target.names(model)}")
 
-        quantizer = AWQ(quant_config, target, execution_device=device)
-        handles = []
-        for m in quantizer.modules_to_scale:
-            handles.append(m.register_forward_pre_hook(quantizer.pre_forward_hook))
+        while args.batch_size > 0:
+            pre_free_memory, _ = torch.cuda.mem_get_info(device)
+            gc.collect()
+            torch.cuda.empty_cache()
+            post_free_memory, _ = torch.cuda.mem_get_info(device)
+            LOGGER.info(f"Cleared memory from {pre_free_memory * 1e-9:.1f}GB to {post_free_memory * 1e-9:.1f}GB")
 
-        # calibrate
-        for i in tqdm.tqdm(
-            range(0, len(ds), args.batch_size), leave=False, desc="Calibrating"
-        ):
-            uncollated_batch = ds[i : i + args.batch_size]
-            collated_batch = default_data_collator(uncollated_batch)
-            model_inputs = model.prepare_inputs_for_generation(**collated_batch)
-            model_inputs = {k: v.to(device) if v is not None else v for k, v in model_inputs.items()}
+            quantizer = AWQ(quant_config, target, execution_device=device)
+            handles: list["torch.utils.hooks.RemovableHandle"] = []
+            for m in quantizer.modules_to_scale:
+                handles.append(m.register_forward_pre_hook(quantizer.pre_forward_hook))
+
+            # calibrate
+            model = cpu_offload(model, execution_device=device)
             try:
-                _ = model(**model_inputs)
-            except ForwardPassEarlyStop:
-                pass
+                for i in tqdm.tqdm(
+                    range(0, len(ds), args.batch_size), leave=False, desc="Capturing layer inputs"
+                ):
+                    uncollated_batch = ds[i : i + args.batch_size]
+                    collated_batch = default_data_collator(uncollated_batch)
+                    model_inputs = model.prepare_inputs_for_generation(**collated_batch)
+                    model_inputs = {k: v.to(device) if v is not None else v for k, v in model_inputs.items()}
+                    try:
+                        _ = model(**model_inputs)
+                    except ForwardPassEarlyStop:
+                        pass
+                model = remove_hook_from_module(model, recurse=True)
+                for hook in handles:
+                    hook.remove()
+                break
+            except torch.OutOfMemoryError:
+                args.batch_size //= 2
+                LOGGER.info(f"Out of memory error. Reducing batch size to {args.batch_size}")
+                model = remove_hook_from_module(model, recurse=True)
+                for hook in handles:
+                    hook.remove()
+        
+        assert args.batch_size > 0, "Not enough memory to run quantization"
 
         # do quantization
-        quantized_module = quantizer.quantize_module()
-        assert quantized_module is not None
-        setattr(model, name, quantized_module)
-
+        quantizer.quantize()
         pbar.update()
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
@@ -227,12 +243,13 @@ def make_awq_plan(model) -> list[AWQTarget]:
                     ],
                 )
             )
-            plan.append(
-                AWQTarget(
-                    inverse_scale=decoder.self_attn.v_proj,
-                    scale=[decoder.self_attn.o_proj],
+            if decoder.self_attn.v_proj.out_features == decoder.self_attn.o_proj.in_features:
+                plan.append(
+                    AWQTarget(
+                        inverse_scale=decoder.self_attn.v_proj,
+                        scale=[decoder.self_attn.o_proj],
+                    )
                 )
-            )
             if decoder.is_moe_layer:
                 assert isinstance(decoder.feed_forward, Llama4TextMoe)
                 # NOTE: NOT quantizing experts yet
@@ -240,9 +257,16 @@ def make_awq_plan(model) -> list[AWQTarget]:
                     AWQTarget(
                         inverse_scale=decoder.post_attention_layernorm,
                         scale=[
-                            decoder.feed_forward.shared_expert,
+                            decoder.feed_forward.shared_expert.gate_proj,
+                            decoder.feed_forward.shared_expert.up_proj,
                             decoder.feed_forward.router,
                         ],
+                    )
+                )
+                plan.append(
+                    AWQTarget(
+                        inverse_scale=decoder.feed_forward.shared_expert.up_proj,
+                        scale=[decoder.feed_forward.shared_expert.down_proj]
                     )
                 )
             else:

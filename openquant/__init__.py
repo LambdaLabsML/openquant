@@ -1,4 +1,3 @@
-import weakref
 import logging
 
 import tqdm
@@ -16,7 +15,7 @@ def get_attn_implementation():
         LOGGER.info(f"Using flash attention")
         return "flash_attention_2"
     except ImportError:
-        LOGGER.warning(f"`import flash_attn` not found, pip install to use")
+        LOGGER.warning(f"`import flash_attn` not found, run `pip install flash-attn --no-build-isolation`")
         return None
 
 
@@ -244,13 +243,15 @@ class AWQ:
         raise ForwardPassEarlyStop()
 
     @torch.inference_mode()
-    def quantize_module(self):
+    def quantize(self):
+        inp_dim = self.modules_to_scale[0].in_features
+        assert inp_dim % self.qcfg.group_size == 0
+        assert all(m.in_features == inp_dim for m in self.modules_to_scale)
+
+        for x in self.xs:
+            assert x.ndim == 2 and x.shape[1] == inp_dim
         total_batch_size = sum(x.shape[0] for x in self.xs)
         assert total_batch_size > 0
-
-        _, inp_dim = self.modules_to_scale[0].weight.shape
-        assert inp_dim % self.qcfg.group_size == 0
-        assert all(m.weight.shape[1] == inp_dim for m in self.modules_to_scale)
 
         w = torch.cat([m.weight for m in self.modules_to_scale]).to(
             self.execution_device
@@ -284,19 +285,16 @@ class AWQ:
             s = s_x.pow(alpha).clamp(min=1e-8)
             s[torch.isinf(s) | torch.isnan(s)] = 1
 
-            s_m = s.repeat(len(self.modules_to_scale))
-
-            w_s = w * s_m
+            w_s = w * s
             w_q = self.qcfg.quantize_tensor(w_s, *self.qcfg.compute_qparams(w_s))
 
             loss = 0
             for x in self.xs:
                 x = x.to(self.execution_device)
                 y = F.linear(x, w, bias=b)
-                y_q = F.linear(x / s_m, w_q, bias=b)
-                loss += (y - y_q).float().square().sum() / (
-                    total_batch_size * self.out_dim
-                )
+                y_q = F.linear(x / s, w_q, bias=b)
+                loss += (y - y_q).float().square().sum()
+            loss /= total_batch_size * w.shape[0]
 
             if loss < best_loss:
                 best_loss = loss
@@ -304,21 +302,27 @@ class AWQ:
                 best_alpha = alpha
 
             pbar.set_description(
-                f"Searching scales: loss@{best_loss:.5f} alpha@{best_alpha:.3f}",
+                f"Searching scales: best_loss={best_loss} @ alpha={best_alpha:.3f}",
                 refresh=False,
             )
             pbar.update()
 
         # Apply scale to module
         for module in self.modules_to_scale:
-            module.weight.mul(best_s.view(1, -1))
+            w = module.weight.data
+            w_s = w * best_s
+            w_q = self.qcfg.quantize_tensor(w_s, *self.qcfg.compute_qparams(w_s))
+            module.weight.data = w_q
 
         # Apply scale to parent op
         parent = self.module_to_inverse_scale
         parent_op_name = parent.__class__.__name__.lower()
         if isinstance(parent, torch.nn.Linear):
-            parent.weight.div_(best_s.view(-1, 1))
+            assert parent.out_features == inp_dim, (inp_dim, parent.in_features, parent.out_features)
+            assert parent.weight.shape[0] == inp_dim, (inp_dim, parent.weight.shape)
+            parent.weight.div_(best_s.view(inp_dim, 1))
             if parent.bias is not None:
+                assert parent.bias.shape[0] == inp_dim, (inp_dim, parent.bias.shape)
                 parent.bias.div_(best_s)
 
         elif "norm" in parent_op_name:
@@ -335,17 +339,14 @@ class AWQ:
         else:
             raise NotImplementedError(f"Can't rescale previous op {parent}")
 
-        # # Search for best clip
-        apply_clip = not any(
-            p in self.name for p in ["q_", "k_", "query", "key", "Wqkv"]
-        )
-        if apply_clip:
-            for x in self.xs:
-                x.div_(best_s)
-
-            raise NotImplementedError()
-
-        raise NotImplementedError()
+        # Search for best clip
+        # apply_clip = not any(
+        #     p in self.name for p in ["q_", "k_", "query", "key", "Wqkv"]
+        # )
+        # if apply_clip:
+        #     for x in self.xs:
+        #         x.div_(best_s)
+        
 
     @classmethod
     def get_transformers_quant_config(cls, qcfg: QuantConfig) -> dict:
