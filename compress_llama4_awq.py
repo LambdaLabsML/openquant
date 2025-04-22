@@ -1,100 +1,3 @@
-from transformers.models.llama4.modeling_llama4 import (
-    Llama4ForConditionalGeneration,
-    Llama4TextDecoderLayer,
-    Llama4TextMoe,
-    Llama4TextMLP,
-    Llama4VisionEncoderLayer,
-)
-
-
-def awq_plan(model: Llama4ForConditionalGeneration):
-    assert isinstance(model, Llama4ForConditionalGeneration)
-    plan = []
-
-    # encoder: Llama4VisionEncoderLayer
-    # for encoder in model.vision_model.model.layers:
-    #     plan.append(
-    #         dict(
-    #             inverse_scale=encoder.input_layernorm,
-    #             scale=[
-    #                 encoder.self_attn.q_proj,
-    #                 encoder.self_attn.k_proj,
-    #                 encoder.self_attn.v_proj,
-    #             ],
-    #         )
-    #     )
-    #     plan.append(
-    #         dict(
-    #             inverse_scale=encoder.self_attn.v_proj,
-    #             scale=[encoder.self_attn.o_proj],
-    #         )
-    #     )
-    #     plan.append(
-    #         dict(
-    #             inverse_scale=encoder.post_attention_layernorm,
-    #             scale=[encoder.mlp.fc1],
-    #         )
-    #     )
-    #     plan.append(
-    #         dict(
-    #             # TODO there is a GELU activation after fc1 & before fc2,
-    #             # which is roughly x * Phi(x), which I think means we scale the output of fc1?
-    #             inverse_scale=encoder.mlp.fc1,
-    #             scale=[encoder.mlp.fc2],
-    #         )
-    #     )
-
-    # text model
-    decoder: Llama4TextDecoderLayer
-    for decoder in model.language_model.model.layers:
-        plan.append(
-            dict(
-                inverse_scale=decoder.input_layernorm,
-                scale=[
-                    decoder.self_attn.q_proj,
-                    decoder.self_attn.k_proj,
-                    decoder.self_attn.v_proj,
-                ],
-            )
-        )
-        plan.append(
-            dict(
-                inverse_scale=decoder.self_attn.v_proj,
-                scale=[decoder.self_attn.o_proj],
-            )
-        )
-        if decoder.is_moe_layer:
-            assert isinstance(decoder.feed_forward, Llama4TextMoe)
-            # NOTE: NOT quantizing experts yet
-            plan.append(
-                dict(
-                    inverse_scale=decoder.post_attention_layernorm,
-                    scale=[
-                        decoder.feed_forward.shared_expert,
-                        decoder.feed_forward.router,
-                    ],
-                )
-            )
-        else:
-            assert isinstance(decoder.feed_forward, Llama4TextMLP)
-            plan.append(
-                dict(
-                    inverse_scale=decoder.post_attention_layernorm,
-                    scale=[
-                        decoder.feed_forward.gate_proj,
-                        decoder.feed_forward.up_proj,
-                    ],
-                )
-            )
-
-            plan.append(
-                dict(
-                    inverse_scale=decoder.feed_forward.up_proj,
-                    scale=[decoder.feed_forward.down_proj],
-                )
-            )
-
-
 import argparse
 import os
 import logging
@@ -111,6 +14,8 @@ from openquant import (
     AWQ,
     QuantConfig,
     ForwardPassEarlyStop,
+    get_attn_implementation,
+    AWQTarget,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -174,6 +79,11 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
+    quant_config = QuantConfig(num_bits=4)
+    LOGGER.info(
+        f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
+    )
+
     tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
         args.model, trust_remote_code=True
     )
@@ -194,6 +104,7 @@ def main():
             add_special_tokens=False,
         )
 
+    LOGGER.info(f"Loading dataset {args.dataset}")
     ds = datasets.load_dataset(
         args.dataset, args.dataset_name, split=args.dataset_split
     )
@@ -202,45 +113,27 @@ def main():
     ds = ds.map(tokenize, remove_columns=ds.column_names)
     ds = ds.to_list()
 
-    try:
-        import flash_attn
-
-        attn_implementation = "flash_attention_2"
-        LOGGER.info(f"Using flash attention")
-    except ImportError:
-        attn_implementation = None
-        LOGGER.info(f"`import flash_attn` not found, pip install to use")
-
+    LOGGER.info(f"Loading {args.model}")
+    attn_impl = get_attn_implementation()
     if args.cpu_offload:
         model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-            args.model, attn_implementation=attn_implementation
+            args.model, attn_implementation=attn_impl
         )
         cpu_offload(model, execution_device=device)
     else:
         with device:
             model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-                args.model, attn_implementation=attn_implementation
+                args.model, attn_implementation=attn_impl
             )
 
-    quant_config = QuantConfig(num_bits=4)
-
-    LOGGER.info(
-        f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
-    )
-
-    plan = awq_plan(model)
+    plan = make_awq_plan(model)
+    LOGGER.info(f"{len(plan)} quantizing targets")
 
     pbar = tqdm.tqdm(total=len(plan))
-    for target in plan.items():
-        pbar.set_description(f"Quantizing {target}")
+    for target in plan:
+        pbar.set_description(f"Quantizing {target.names(model)}")
 
-        quantizer = AWQ(
-            quant_config,
-            module_to_inverse_scale=target["inverse_scale"],
-            modules_to_scale=target["scale"],
-            execution_device=device,
-            storage_device=torch.device("cpu"),
-        )
+        quantizer = AWQ(quant_config, target, execution_device=device)
         for m in quantizer.modules_to_scale:
             m.register_forward_pre_hook(quantizer.pre_forward_hook)
 
@@ -267,6 +160,103 @@ def main():
     model.config.quantization_config = AWQ.get_transformers_quant_config(quant_config)
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
+
+
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4ForConditionalGeneration,
+    Llama4TextDecoderLayer,
+    Llama4TextMoe,
+    Llama4TextMLP,
+    Llama4VisionEncoderLayer,
+)
+
+
+def make_awq_plan(model: Llama4ForConditionalGeneration) -> list[AWQTarget]:
+    assert isinstance(model, Llama4ForConditionalGeneration)
+    plan = []
+
+    # encoder: Llama4VisionEncoderLayer
+    # for encoder in model.vision_model.model.layers:
+    #     plan.append(
+    #         dict(
+    #             inverse_scale=encoder.input_layernorm,
+    #             scale=[
+    #                 encoder.self_attn.q_proj,
+    #                 encoder.self_attn.k_proj,
+    #                 encoder.self_attn.v_proj,
+    #             ],
+    #         )
+    #     )
+    #     plan.append(
+    #         dict(
+    #             inverse_scale=encoder.self_attn.v_proj,
+    #             scale=[encoder.self_attn.o_proj],
+    #         )
+    #     )
+    #     plan.append(
+    #         dict(
+    #             inverse_scale=encoder.post_attention_layernorm,
+    #             scale=[encoder.mlp.fc1],
+    #         )
+    #     )
+    #     plan.append(
+    #         dict(
+    #             # TODO there is a GELU activation after fc1 & before fc2,
+    #             # which is roughly x * Phi(x), which I think means we scale the output of fc1?
+    #             inverse_scale=encoder.mlp.fc1,
+    #             scale=[encoder.mlp.fc2],
+    #         )
+    #     )
+
+    # text model
+    decoder: Llama4TextDecoderLayer
+    for decoder in model.language_model.model.layers:
+        plan.append(
+            AWQTarget(
+                inverse_scale=decoder.input_layernorm,
+                scale=[
+                    decoder.self_attn.q_proj,
+                    decoder.self_attn.k_proj,
+                    decoder.self_attn.v_proj,
+                ],
+            )
+        )
+        plan.append(
+            AWQTarget(
+                inverse_scale=decoder.self_attn.v_proj,
+                scale=[decoder.self_attn.o_proj],
+            )
+        )
+        if decoder.is_moe_layer:
+            assert isinstance(decoder.feed_forward, Llama4TextMoe)
+            # NOTE: NOT quantizing experts yet
+            plan.append(
+                AWQTarget(
+                    inverse_scale=decoder.post_attention_layernorm,
+                    scale=[
+                        decoder.feed_forward.shared_expert,
+                        decoder.feed_forward.router,
+                    ],
+                )
+            )
+        else:
+            assert isinstance(decoder.feed_forward, Llama4TextMLP)
+            plan.append(
+                AWQTarget(
+                    inverse_scale=decoder.post_attention_layernorm,
+                    scale=[
+                        decoder.feed_forward.gate_proj,
+                        decoder.feed_forward.up_proj,
+                    ],
+                )
+            )
+
+            plan.append(
+                AWQTarget(
+                    inverse_scale=decoder.feed_forward.up_proj,
+                    scale=[decoder.feed_forward.down_proj],
+                )
+            )
 
 
 if __name__ == "__main__":

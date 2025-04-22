@@ -9,6 +9,17 @@ import torch.nn.functional as F
 LOGGER = logging.getLogger(__name__)
 
 
+def get_attn_implementation():
+    try:
+        import flash_attn
+
+        LOGGER.info(f"Using flash attention")
+        return "flash_attention_2"
+    except ImportError:
+        LOGGER.info(f"`import flash_attn` not found, pip install to use")
+        return None
+
+
 class ForwardPassEarlyStop(Exception):
     pass
 
@@ -177,6 +188,21 @@ class QuantConfig:
 #         raise NotImplementedError()
 
 
+class AWQTarget:
+    def __init__(self, *, inverse_scale: torch.nn.Module, scale: list[torch.nn.Module]):
+        self.inverse_scale = inverse_scale
+        self.scale = scale
+
+    def names(self, root: torch.nn.Module):
+        tmp = [""] * len(self.scale)
+        for name, haystack in root.named_modules():
+            for i in range(self.scale):
+                if haystack == self.scale[i]:
+                    tmp[i] = name
+                    break
+        return tmp
+
+
 class AWQ:
     """
     AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration
@@ -187,12 +213,15 @@ class AWQ:
     def __init__(
         self,
         qcfg: QuantConfig,
-        module_to_inverse_scale: torch.nn.Module,
-        modules_to_scale: list[torch.nn.Linear],
+        target: AWQTarget,
         execution_device: torch.device,
-        storage_device: torch.device,
+        storage_device: torch.device = torch.device("cpu"),
         search_grid_size: int = 20,
     ):
+        self.target = target
+        module_to_inverse_scale: torch.nn.Module = target.inverse_scale
+        modules_to_scale: list[torch.nn.Linear] = target.scale
+
         if modules_to_scale[0].bias is not None:
             assert all(m.bias is not None for m in modules_to_scale)
         else:
@@ -216,7 +245,6 @@ class AWQ:
 
     @torch.inference_mode()
     def quantize_module(self):
-
         total_batch_size = sum(x.shape[0] for x in self.xs)
         assert total_batch_size > 0
 
