@@ -16,7 +16,7 @@ def get_attn_implementation():
         LOGGER.info(f"Using flash attention")
         return "flash_attention_2"
     except ImportError:
-        LOGGER.info(f"`import flash_attn` not found, pip install to use")
+        LOGGER.warning(f"`import flash_attn` not found, pip install to use")
         return None
 
 
@@ -196,7 +196,7 @@ class AWQTarget:
     def names(self, root: torch.nn.Module):
         tmp = [""] * len(self.scale)
         for name, haystack in root.named_modules():
-            for i in range(self.scale):
+            for i in range(len(self.scale)):
                 if haystack == self.scale[i]:
                     tmp[i] = name
                     break
@@ -240,7 +240,7 @@ class AWQ:
         assert isinstance(args, tuple) and len(args) == 1
         x = args[0]
         assert isinstance(x, torch.Tensor)
-        self.xs.append(x.to(self.storage_device).reshape(-1, self.inp_dim))
+        self.xs.append(x.to(self.storage_device).reshape(-1, x.shape[-1]))
         raise ForwardPassEarlyStop()
 
     @torch.inference_mode()
@@ -248,21 +248,22 @@ class AWQ:
         total_batch_size = sum(x.shape[0] for x in self.xs)
         assert total_batch_size > 0
 
-        _, inp_dim = self.modules_to_scale[0].shape
+        _, inp_dim = self.modules_to_scale[0].weight.shape
         assert inp_dim % self.qcfg.group_size == 0
-        assert all(m.shape[1] == inp_dim for m in self.modules_to_scale)
+        assert all(m.weight.shape[1] == inp_dim for m in self.modules_to_scale)
 
         w = torch.cat([m.weight for m in self.modules_to_scale]).to(
             self.execution_device
         )
         b = None
-        if self.modules_to_scale[0][1].bias is not None:
+        if self.modules_to_scale[0].bias is not None:
             b = torch.cat([m.bias for m in self.modules_to_scale]).to(
                 self.execution_device
             )
 
         # TODO filter out padded!!!
 
+        # NOTE: input magnitude calculation (per input channel i.e. per `inp_dim`)
         s_x: torch.Tensor = 0
         for x in self.xs:
             # NOTE: x has shape [batch, inp_dim]

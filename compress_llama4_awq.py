@@ -61,7 +61,7 @@ def main():
         type=int,
         help="Number of calibration samples to process at the same time.",
     )
-    parser.add_argument("--cpu-offload", default=False, action="store_true")
+    parser.add_argument("--disable-cpu-offload", default=False, action="store_true")
     args = parser.parse_args()
 
     model_name = os.path.basename(args.model)
@@ -115,27 +115,28 @@ def main():
 
     LOGGER.info(f"Loading {args.model}")
     attn_impl = get_attn_implementation()
-    if args.cpu_offload:
+    
+    load_device = device if args.disable_cpu_offload else torch.device("cpu")
+    with load_device:
         model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             args.model, attn_implementation=attn_impl
         )
-        cpu_offload(model, execution_device=device)
-    else:
-        with device:
-            model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-                args.model, attn_implementation=attn_impl
-            )
+    if not args.disable_cpu_offload:
+        model = cpu_offload(model, execution_device=device)
 
     plan = make_awq_plan(model)
-    LOGGER.info(f"{len(plan)} quantizing targets")
+    LOGGER.info(f"{len(plan)} quantization targets")
+    for i, target in enumerate(plan):
+        LOGGER.info(f"{i+1}. {target.names(model)}")
 
     pbar = tqdm.tqdm(total=len(plan))
     for target in plan:
         pbar.set_description(f"Quantizing {target.names(model)}")
 
         quantizer = AWQ(quant_config, target, execution_device=device)
+        handles = []
         for m in quantizer.modules_to_scale:
-            m.register_forward_pre_hook(quantizer.pre_forward_hook)
+            handles.append(m.register_forward_pre_hook(quantizer.pre_forward_hook))
 
         # calibrate
         for i in tqdm.tqdm(
@@ -144,6 +145,7 @@ def main():
             uncollated_batch = ds[i : i + args.batch_size]
             collated_batch = default_data_collator(uncollated_batch)
             model_inputs = model.prepare_inputs_for_generation(**collated_batch)
+            model_inputs = {k: v.to(device) if v is not None else v for k, v in model_inputs.items()}
             try:
                 _ = model(**model_inputs)
             except ForwardPassEarlyStop:
@@ -168,95 +170,101 @@ from transformers.models.llama4.modeling_llama4 import (
     Llama4TextMoe,
     Llama4TextMLP,
     Llama4VisionEncoderLayer,
+    Llama4ForCausalLM
 )
 
 
-def make_awq_plan(model: Llama4ForConditionalGeneration) -> list[AWQTarget]:
-    assert isinstance(model, Llama4ForConditionalGeneration)
+def make_awq_plan(model) -> list[AWQTarget]:
     plan = []
 
-    # encoder: Llama4VisionEncoderLayer
-    # for encoder in model.vision_model.model.layers:
-    #     plan.append(
-    #         dict(
-    #             inverse_scale=encoder.input_layernorm,
-    #             scale=[
-    #                 encoder.self_attn.q_proj,
-    #                 encoder.self_attn.k_proj,
-    #                 encoder.self_attn.v_proj,
-    #             ],
-    #         )
-    #     )
-    #     plan.append(
-    #         dict(
-    #             inverse_scale=encoder.self_attn.v_proj,
-    #             scale=[encoder.self_attn.o_proj],
-    #         )
-    #     )
-    #     plan.append(
-    #         dict(
-    #             inverse_scale=encoder.post_attention_layernorm,
-    #             scale=[encoder.mlp.fc1],
-    #         )
-    #     )
-    #     plan.append(
-    #         dict(
-    #             # TODO there is a GELU activation after fc1 & before fc2,
-    #             # which is roughly x * Phi(x), which I think means we scale the output of fc1?
-    #             inverse_scale=encoder.mlp.fc1,
-    #             scale=[encoder.mlp.fc2],
-    #         )
-    #     )
-
-    # text model
-    decoder: Llama4TextDecoderLayer
-    for decoder in model.language_model.model.layers:
-        plan.append(
-            AWQTarget(
-                inverse_scale=decoder.input_layernorm,
-                scale=[
-                    decoder.self_attn.q_proj,
-                    decoder.self_attn.k_proj,
-                    decoder.self_attn.v_proj,
-                ],
-            )
-        )
-        plan.append(
-            AWQTarget(
-                inverse_scale=decoder.self_attn.v_proj,
-                scale=[decoder.self_attn.o_proj],
-            )
-        )
-        if decoder.is_moe_layer:
-            assert isinstance(decoder.feed_forward, Llama4TextMoe)
-            # NOTE: NOT quantizing experts yet
+    if isinstance(model, Llama4ForConditionalGeneration):
+        encoder: Llama4VisionEncoderLayer
+        for encoder in model.vision_model.model.layers:
             plan.append(
-                AWQTarget(
-                    inverse_scale=decoder.post_attention_layernorm,
+                dict(
+                    inverse_scale=encoder.input_layernorm,
                     scale=[
-                        decoder.feed_forward.shared_expert,
-                        decoder.feed_forward.router,
+                        encoder.self_attn.q_proj,
+                        encoder.self_attn.k_proj,
+                        encoder.self_attn.v_proj,
                     ],
                 )
             )
-        else:
-            assert isinstance(decoder.feed_forward, Llama4TextMLP)
+            plan.append(
+                dict(
+                    inverse_scale=encoder.self_attn.v_proj,
+                    scale=[encoder.self_attn.o_proj],
+                )
+            )
+            plan.append(
+                dict(
+                    inverse_scale=encoder.post_attention_layernorm,
+                    scale=[encoder.mlp.fc1],
+                )
+            )
+            plan.append(
+                dict(
+                    # TODO there is a GELU activation after fc1 & before fc2,
+                    # which is roughly x * Phi(x), which I think means we scale the output of fc1?
+                    inverse_scale=encoder.mlp.fc1,
+                    scale=[encoder.mlp.fc2],
+                )
+            )
+        
+        model = model.language_model
+        
+
+    if isinstance(model, Llama4ForCausalLM):
+        decoder: Llama4TextDecoderLayer
+        for decoder in model.model.layers:
             plan.append(
                 AWQTarget(
-                    inverse_scale=decoder.post_attention_layernorm,
+                    inverse_scale=decoder.input_layernorm,
                     scale=[
-                        decoder.feed_forward.gate_proj,
-                        decoder.feed_forward.up_proj,
+                        decoder.self_attn.q_proj,
+                        decoder.self_attn.k_proj,
+                        decoder.self_attn.v_proj,
                     ],
                 )
             )
-
             plan.append(
                 AWQTarget(
-                    inverse_scale=decoder.feed_forward.up_proj,
-                    scale=[decoder.feed_forward.down_proj],
+                    inverse_scale=decoder.self_attn.v_proj,
+                    scale=[decoder.self_attn.o_proj],
                 )
             )
+            if decoder.is_moe_layer:
+                assert isinstance(decoder.feed_forward, Llama4TextMoe)
+                # NOTE: NOT quantizing experts yet
+                plan.append(
+                    AWQTarget(
+                        inverse_scale=decoder.post_attention_layernorm,
+                        scale=[
+                            decoder.feed_forward.shared_expert,
+                            decoder.feed_forward.router,
+                        ],
+                    )
+                )
+            else:
+                assert isinstance(decoder.feed_forward, Llama4TextMLP)
+                plan.append(
+                    AWQTarget(
+                        inverse_scale=decoder.post_attention_layernorm,
+                        scale=[
+                            decoder.feed_forward.gate_proj,
+                            decoder.feed_forward.up_proj,
+                        ],
+                    )
+                )
+
+                plan.append(
+                    AWQTarget(
+                        inverse_scale=decoder.feed_forward.up_proj,
+                        scale=[decoder.feed_forward.down_proj],
+                    )
+                )
+
+    return plan
 
 
 if __name__ == "__main__":
