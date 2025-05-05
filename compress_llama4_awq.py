@@ -13,7 +13,9 @@ from accelerate import cpu_offload
 from accelerate.hooks import remove_hook_from_module
 
 from openquant import (
-    AWQ,
+    InputCatcher,
+    awq,
+    awq_transformers_quant_config,
     QuantConfig,
     ForwardPassEarlyStop,
     get_attn_implementation,
@@ -129,26 +131,48 @@ def main():
             LOGGER.info(f"{num_targets+1}. {target.names(model)}")
             num_targets += 1
 
-    # TODO add hook to `subgraph = plan[0][0]` for grabbing input & run model
-    subgraph_inputs = []
-    for i in tqdm.tqdm(
-        range(0, len(ds), args.batch_size),
-        leave=False,
-        desc="Computing next layer inputs",
-    ):
-        uncollated_batch = ds[i : i + args.batch_size]
-        collated_batch = default_data_collator(uncollated_batch)
-        model_inputs = model.prepare_inputs_for_generation(**collated_batch)
-        model_inputs = {
-            k: v.to(device) if v is not None else v for k, v in model_inputs.items()
-        }
-        try:
-            _ = model(**model_inputs)
-        except ForwardPassEarlyStop:
-            pass
+    last_subgraph = None
 
     pbar = tqdm.tqdm(total=num_targets)
     for subgraph, targets in plan:
+        input_catcher = InputCatcher(subgraph)
+        if last_subgraph is None:
+            model = cpu_offload(model, execution_device=device)
+
+            for i in tqdm.tqdm(
+                range(0, len(ds), args.batch_size),
+                leave=False,
+                desc="Capturing subgraph inputs",
+            ):
+                uncollated_batch = ds[i : i + args.batch_size]
+                collated_batch = default_data_collator(uncollated_batch)
+                model_inputs = model.prepare_inputs_for_generation(**collated_batch)
+                model_inputs = {
+                    k: v.to(device) if v is not None else v
+                    for k, v in model_inputs.items()
+                }
+                try:
+                    _ = model(**model_inputs)
+                except ForwardPassEarlyStop:
+                    pass
+
+            model = remove_hook_from_module(model, recurse=True)
+        else:
+            last_subgraph.to(device)
+            for i in tqdm.tqdm(
+                range(0, len(ds), args.batch_size),
+                leave=False,
+                desc="Capturing subgraph inputs",
+            ):
+                try:
+                    args, kwargs = subgraph_inputs[i]
+                    _ = last_subgraph(*args, **kwargs)
+                except ForwardPassEarlyStop:
+                    pass
+            last_subgraph.cpu()
+
+        subgraph_inputs = input_catcher.remove_handle_and_get()
+
         for target in targets:
             gc.collect()
             torch.cuda.empty_cache()
@@ -156,11 +180,7 @@ def main():
 
             pbar.set_description(f"Quantizing {target.names(model)}")
 
-            quantizer = AWQ(quant_config, target, execution_device=device)
-            handles: list["torch.utils.hooks.RemovableHandle"] = [
-                m.register_forward_pre_hook(quantizer.pre_forward_hook)
-                for m in quantizer.modules_to_scale
-            ]
+            catchers = [InputCatcher(m) for m in target.scale]
 
             subgraph.to(device)
             for i in tqdm.tqdm(
@@ -169,36 +189,26 @@ def main():
                 desc="Capturing layer inputs",
             ):
                 try:
-                    _ = subgraph(**subgraph_inputs[i])
+                    args, kwargs = subgraph_inputs[i]
+                    _ = subgraph(*args, **kwargs)
                 except ForwardPassEarlyStop:
                     pass
 
-            for hook in handles:
-                hook.remove()
+            inputs = sum([catcher.remove_handle_and_get() for catcher in catchers], [])
 
             # do quantization
             try:
-                quantizer.quantize()
+                awq(quant_config, target, device, inputs)
             except torch.OutOfMemoryError:
-                LOGGER.warning(
-                    f"Can't run quantization while subgraph is on GPU, sending subgraph back to CPU"
-                )
+                LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                quantizer.quantize()
+                awq(quant_config, target, device, inputs)
 
-        subgraph.to(device)
-        for i in tqdm.tqdm(
-            range(0, len(ds), args.batch_size),
-            leave=False,
-            desc="Computing next layer inputs",
-        ):
-            subgraph_inputs[i] = subgraph(**subgraph_inputs[i])
-        subgraph.cpu()
-
+        last_subgraph = subgraph
         pbar.update()
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
-    model.config.quantization_config = AWQ.get_transformers_quant_config(quant_config)
+    model.config.quantization_config = awq_transformers_quant_config(quant_config)
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
 

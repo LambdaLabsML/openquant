@@ -15,7 +15,9 @@ def get_attn_implementation():
         LOGGER.info(f"Using flash attention")
         return "flash_attention_2"
     except ImportError:
-        LOGGER.warning(f"`import flash_attn` not found, run `pip install flash-attn --no-build-isolation`")
+        LOGGER.warning(
+            f"`import flash_attn` not found, run `pip install flash-attn --no-build-isolation`"
+        )
         return None
 
 
@@ -202,159 +204,152 @@ class AWQTarget:
         return tmp
 
 
-class AWQ:
+class InputCatcher:
+    def __init__(self, module: torch.nn.Module):
+        self.module = module
+        self.inputs = []
+        self.handle = self.module.register_forward_pre_hook(
+            self.pre_forward_hook, with_kwargs=True
+        )
+
+    def pre_forward_hook(self, module, args, kwargs):
+        assert module in self.module
+        # TODO send to CPU?
+        self.inputs.append((args, kwargs))
+        raise ForwardPassEarlyStop()
+
+    def remove_handle_and_get(self):
+        self.handle.remove()
+        return self.inputs
+
+
+@torch.inference_mode()
+def awq(
+    qcfg: QuantConfig,
+    target: AWQTarget,
+    execution_device: torch.device,
+    inputs,
+    storage_device: torch.device = torch.device("cpu"),
+    search_grid_size: int = 20,
+):
     """
     AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration
 
     https://arxiv.org/abs/2306.00978
     """
+    xs = []
+    for args, kwargs in inputs:
+        # TODO add to xs
+        pass
 
-    def __init__(
-        self,
-        qcfg: QuantConfig,
-        target: AWQTarget,
-        execution_device: torch.device,
-        storage_device: torch.device = torch.device("cpu"),
-        search_grid_size: int = 20,
-    ):
-        self.target = target
-        module_to_inverse_scale: torch.nn.Module = target.inverse_scale
-        modules_to_scale: list[torch.nn.Linear] = target.scale
+    inp_dim = target.scale[0].in_features
+    assert inp_dim % qcfg.group_size == 0
+    assert all(m.in_features == inp_dim for m in target.scale)
 
-        if modules_to_scale[0].bias is not None:
-            assert all(m.bias is not None for m in modules_to_scale)
-        else:
-            assert all(m.bias is None for m in modules_to_scale)
+    for x in xs:
+        assert x.ndim == 2 and x.shape[1] == inp_dim
+    total_batch_size = sum(x.shape[0] for x in xs)
+    assert total_batch_size > 0
 
-        self.qcfg = qcfg
-        self.module_to_inverse_scale = module_to_inverse_scale
-        self.modules_to_scale = modules_to_scale
-        self.execution_device = execution_device
-        self.storage_device = storage_device
-        self.search_grid_size = search_grid_size
-        self.xs: list[torch.Tensor] = []
+    w = torch.cat([m.weight for m in target.scale]).to(execution_device)
+    b = None
+    if target.scale[0].bias is not None:
+        b = torch.cat([m.bias for m in target.scale]).to(execution_device)
 
-    def pre_forward_hook(self, module, args):
-        assert module in self.modules_to_scale
-        assert isinstance(args, tuple) and len(args) == 1
-        x = args[0]
-        assert isinstance(x, torch.Tensor)
-        self.xs.append(x.to(self.storage_device).reshape(-1, x.shape[-1]))
-        raise ForwardPassEarlyStop()
+    # TODO filter out padded!!!
 
-    @torch.inference_mode()
-    def quantize(self):
-        inp_dim = self.modules_to_scale[0].in_features
-        assert inp_dim % self.qcfg.group_size == 0
-        assert all(m.in_features == inp_dim for m in self.modules_to_scale)
+    # NOTE: input magnitude calculation (per input channel i.e. per `inp_dim`)
+    s_x: torch.Tensor = 0
+    for x in xs:
+        # NOTE: x has shape [batch, inp_dim]
+        x = x.to(execution_device)
+        # NOTE: this is the group-wise functionality
+        g_x = x.reshape(x.shape[0], -1, qcfg.group_size)
+        s_x += g_x.abs().sum(0) / total_batch_size
+    s_x = s_x.reshape(inp_dim)
 
-        for x in self.xs:
-            assert x.ndim == 2 and x.shape[1] == inp_dim
-        total_batch_size = sum(x.shape[0] for x in self.xs)
-        assert total_batch_size > 0
+    # Find best scale
+    best_loss = float("inf")
+    best_s = None
+    best_alpha = None
+    pbar = tqdm.tqdm(total=search_grid_size + 1, leave=False, desc="Searching scales")
+    for alpha in torch.linspace(0, 1, steps=search_grid_size + 1):
+        s = s_x.pow(alpha).clamp(min=1e-8)
+        s[torch.isinf(s) | torch.isnan(s)] = 1
 
-        w = torch.cat([m.weight for m in self.modules_to_scale]).to(
-            self.execution_device
+        w_s = w * s
+        w_q = qcfg.quantize_tensor(w_s, *qcfg.compute_qparams(w_s))
+
+        loss = 0
+        for x in xs:
+            x = x.to(execution_device)
+            y = F.linear(x, w, bias=b)
+            y_q = F.linear(x / s, w_q, bias=b)
+            loss += (y - y_q).float().square().sum()
+        loss /= total_batch_size * w.shape[0]
+
+        if loss < best_loss:
+            best_loss = loss
+            best_s = s.to(storage_device)
+            best_alpha = alpha
+
+        pbar.set_description(
+            f"Searching scales: best_loss={best_loss} @ alpha={best_alpha:.3f}",
+            refresh=False,
         )
-        b = None
-        if self.modules_to_scale[0].bias is not None:
-            b = torch.cat([m.bias for m in self.modules_to_scale]).to(
-                self.execution_device
-            )
+        pbar.update()
 
-        # TODO filter out padded!!!
+    # Apply scale to module
+    for module in target.scale:
+        w = module.weight.data
+        w_s = w * best_s
+        w_q = qcfg.quantize_tensor(w_s, *qcfg.compute_qparams(w_s))
+        module.weight.data = w_q
 
-        # NOTE: input magnitude calculation (per input channel i.e. per `inp_dim`)
-        s_x: torch.Tensor = 0
-        for x in self.xs:
-            # NOTE: x has shape [batch, inp_dim]
-            x = x.to(self.execution_device)
-            # NOTE: this is the group-wise functionality
-            g_x = x.reshape(x.shape[0], -1, self.qcfg.group_size)
-            s_x += g_x.abs().sum(0) / total_batch_size
-        s_x = s_x.reshape(inp_dim)
-
-        # Find best scale
-        best_loss = float("inf")
-        best_s = None
-        best_alpha = None
-        pbar = tqdm.tqdm(
-            total=self.search_grid_size + 1, leave=False, desc="Searching scales"
+    # Apply scale to parent op
+    parent = target.inverse_scale
+    parent_op_name = parent.__class__.__name__.lower()
+    if isinstance(parent, torch.nn.Linear):
+        assert parent.out_features == inp_dim, (
+            inp_dim,
+            parent.in_features,
+            parent.out_features,
         )
-        for alpha in torch.linspace(0, 1, steps=self.search_grid_size + 1):
-            s = s_x.pow(alpha).clamp(min=1e-8)
-            s[torch.isinf(s) | torch.isnan(s)] = 1
+        assert parent.weight.shape[0] == inp_dim, (inp_dim, parent.weight.shape)
+        parent.weight.div_(best_s.view(inp_dim, 1))
+        if parent.bias is not None:
+            assert parent.bias.shape[0] == inp_dim, (inp_dim, parent.bias.shape)
+            parent.bias.div_(best_s)
 
-            w_s = w * s
-            w_q = self.qcfg.quantize_tensor(w_s, *self.qcfg.compute_qparams(w_s))
-
-            loss = 0
-            for x in self.xs:
-                x = x.to(self.execution_device)
-                y = F.linear(x, w, bias=b)
-                y_q = F.linear(x / s, w_q, bias=b)
-                loss += (y - y_q).float().square().sum()
-            loss /= total_batch_size * w.shape[0]
-
-            if loss < best_loss:
-                best_loss = loss
-                best_s = s.to(self.storage_device)
-                best_alpha = alpha
-
-            pbar.set_description(
-                f"Searching scales: best_loss={best_loss} @ alpha={best_alpha:.3f}",
-                refresh=False,
-            )
-            pbar.update()
-
-        # Apply scale to module
-        for module in self.modules_to_scale:
-            w = module.weight.data
-            w_s = w * best_s
-            w_q = self.qcfg.quantize_tensor(w_s, *self.qcfg.compute_qparams(w_s))
-            module.weight.data = w_q
-
-        # Apply scale to parent op
-        parent = self.module_to_inverse_scale
-        parent_op_name = parent.__class__.__name__.lower()
-        if isinstance(parent, torch.nn.Linear):
-            assert parent.out_features == inp_dim, (inp_dim, parent.in_features, parent.out_features)
-            assert parent.weight.shape[0] == inp_dim, (inp_dim, parent.weight.shape)
-            parent.weight.div_(best_s.view(inp_dim, 1))
-            if parent.bias is not None:
-                assert parent.bias.shape[0] == inp_dim, (inp_dim, parent.bias.shape)
-                parent.bias.div_(best_s)
-
-        elif "norm" in parent_op_name:
-            assert hasattr(parent, "weight")
-            if "gemma" in parent_op_name:
-                parent.weight += 1
-                parent.weight.div_(best_s)
-                parent.weight -= 1
-            else:
-                parent.weight.div_(best_s)
-            if hasattr(parent, "bias") and parent.bias is not None:
-                parent.bias.div_(best_s)
-
+    elif "norm" in parent_op_name:
+        assert hasattr(parent, "weight")
+        if "gemma" in parent_op_name:
+            parent.weight += 1
+            parent.weight.div_(best_s)
+            parent.weight -= 1
         else:
-            raise NotImplementedError(f"Can't rescale previous op {parent}")
+            parent.weight.div_(best_s)
+        if hasattr(parent, "bias") and parent.bias is not None:
+            parent.bias.div_(best_s)
 
-        # Search for best clip
-        # apply_clip = not any(
-        #     p in self.name for p in ["q_", "k_", "query", "key", "Wqkv"]
-        # )
-        # if apply_clip:
-        #     for x in self.xs:
-        #         x.div_(best_s)
-        
+    else:
+        raise NotImplementedError(f"Can't rescale previous op {parent}")
 
-    @classmethod
-    def get_transformers_quant_config(cls, qcfg: QuantConfig) -> dict:
-        return {
-            "quant_method": "awq",
-            "zero_point": qcfg.zero_point,
-            "group_size": qcfg.group_size,
-            "bits": qcfg.num_bits,
-            "version": "gemm",
-            "modules_to_not_convert": None,
-        }
+    # Search for best clip
+    # apply_clip = not any(
+    #     p in self.name for p in ["q_", "k_", "query", "key", "Wqkv"]
+    # )
+    # if apply_clip:
+    #     for x in self.xs:
+    #         x.div_(best_s)
+
+
+def awq_transformers_quant_config(qcfg: QuantConfig) -> dict:
+    return {
+        "quant_method": "awq",
+        "zero_point": qcfg.zero_point,
+        "group_size": qcfg.group_size,
+        "bits": qcfg.num_bits,
+        "version": "gemm",
+        "modules_to_not_convert": None,
+    }
