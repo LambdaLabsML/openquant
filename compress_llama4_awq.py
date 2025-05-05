@@ -135,9 +135,10 @@ def main():
 
     pbar = tqdm.tqdm(total=num_targets)
     for subgraph, targets in plan:
-        input_catcher = InputCatcher(subgraph)
         if last_subgraph is None:
-            model = cpu_offload(model, execution_device=device)
+            input_catcher = InputCatcher(subgraph)
+            model.model.embed_tokens.to(device)
+            model.model.rotary_emb.to(device)
 
             for i in tqdm.tqdm(
                 range(0, len(ds), args.batch_size),
@@ -155,57 +156,53 @@ def main():
                     _ = model(**model_inputs)
                 except ForwardPassEarlyStop:
                     pass
+            model.cpu()
 
-            model = remove_hook_from_module(model, recurse=True)
+            subgraph_inputs = input_catcher.remove_handle_and_get()
         else:
             last_subgraph.to(device)
             for i in tqdm.tqdm(
-                range(0, len(ds), args.batch_size),
+                range(len(subgraph_inputs)),
                 leave=False,
                 desc="Capturing subgraph inputs",
             ):
                 try:
-                    args, kwargs = subgraph_inputs[i]
-                    _ = last_subgraph(*args, **kwargs)
+                    subgraph_inputs[i][0] = last_subgraph(
+                        *subgraph_inputs[i][0], **subgraph_inputs[i][1]
+                    )
                 except ForwardPassEarlyStop:
                     pass
             last_subgraph.cpu()
 
-        subgraph_inputs = input_catcher.remove_handle_and_get()
+        assert len(subgraph_inputs) == len(ds) // args.batch_size, len(subgraph_inputs)
 
         for target in targets:
             gc.collect()
             torch.cuda.empty_cache()
             LOGGER.debug(f"{torch.cuda.mem_get_info(device)[0] * 1e-9:.1f}GB available")
 
-            pbar.set_description(f"Quantizing {target.names(model)}")
-
             catchers = [InputCatcher(m) for m in target.scale]
 
             subgraph.to(device)
-            for i in tqdm.tqdm(
-                range(0, len(ds), args.batch_size),
-                leave=False,
-                desc="Capturing layer inputs",
+            for a, k in tqdm.tqdm(
+                subgraph_inputs, leave=False, desc="Capturing layer inputs"
             ):
                 try:
-                    args, kwargs = subgraph_inputs[i]
-                    _ = subgraph(*args, **kwargs)
+                    _ = subgraph(*a, **k)
                 except ForwardPassEarlyStop:
                     pass
 
             inputs = sum([catcher.remove_handle_and_get() for catcher in catchers], [])
-
-            # do quantization
             try:
-                awq(quant_config, target, device, inputs)
+                awq(quant_config, target.scale, target.inverse_scale, device, inputs)
             except torch.OutOfMemoryError:
                 LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                awq(quant_config, target, device, inputs)
+                awq(quant_config, target.scale, target.inverse_scale, device, inputs)
+
+            pbar.update()
 
         last_subgraph = subgraph
-        pbar.update()
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
     model.config.quantization_config = awq_transformers_quant_config(quant_config)

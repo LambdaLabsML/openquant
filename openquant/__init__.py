@@ -213,9 +213,8 @@ class InputCatcher:
         )
 
     def pre_forward_hook(self, module, args, kwargs):
-        assert module in self.module
-        # TODO send to CPU?
-        self.inputs.append((args, kwargs))
+        assert module == self.module
+        self.inputs.append([args, kwargs])
         raise ForwardPassEarlyStop()
 
     def remove_handle_and_get(self):
@@ -226,7 +225,8 @@ class InputCatcher:
 @torch.inference_mode()
 def awq(
     qcfg: QuantConfig,
-    target: AWQTarget,
+    modules_to_scale: list[torch.nn.Linear],
+    module_to_inverse_scale: torch.nn.Module,
     execution_device: torch.device,
     inputs,
     storage_device: torch.device = torch.device("cpu"),
@@ -237,32 +237,30 @@ def awq(
 
     https://arxiv.org/abs/2306.00978
     """
+    inp_dim = modules_to_scale[0].in_features
+    assert inp_dim % qcfg.group_size == 0
+    assert all(m.in_features == inp_dim for m in modules_to_scale)
+
     xs = []
     for args, kwargs in inputs:
-        # TODO add to xs
-        pass
+        assert len(args) == 1, len(args)
+        assert isinstance(args[0], torch.Tensor)
+        assert args[0].shape[-1] == inp_dim, args[0].shape
+        xs.append(args[0].reshape(-1, inp_dim).to(execution_device))
 
-    inp_dim = target.scale[0].in_features
-    assert inp_dim % qcfg.group_size == 0
-    assert all(m.in_features == inp_dim for m in target.scale)
-
-    for x in xs:
-        assert x.ndim == 2 and x.shape[1] == inp_dim
     total_batch_size = sum(x.shape[0] for x in xs)
     assert total_batch_size > 0
 
-    w = torch.cat([m.weight for m in target.scale]).to(execution_device)
+    w = torch.cat([m.weight for m in modules_to_scale]).to(execution_device)
     b = None
-    if target.scale[0].bias is not None:
-        b = torch.cat([m.bias for m in target.scale]).to(execution_device)
-
-    # TODO filter out padded!!!
+    if modules_to_scale[0].bias is not None:
+        b = torch.cat([m.bias for m in modules_to_scale]).to(execution_device)
 
     # NOTE: input magnitude calculation (per input channel i.e. per `inp_dim`)
     s_x: torch.Tensor = 0
+    # TODO filter out padded!!!
     for x in xs:
         # NOTE: x has shape [batch, inp_dim]
-        x = x.to(execution_device)
         # NOTE: this is the group-wise functionality
         g_x = x.reshape(x.shape[0], -1, qcfg.group_size)
         s_x += g_x.abs().sum(0) / total_batch_size
@@ -282,7 +280,6 @@ def awq(
 
         loss = 0
         for x in xs:
-            x = x.to(execution_device)
             y = F.linear(x, w, bias=b)
             y_q = F.linear(x / s, w_q, bias=b)
             loss += (y - y_q).float().square().sum()
@@ -290,7 +287,7 @@ def awq(
 
         if loss < best_loss:
             best_loss = loss
-            best_s = s.to(storage_device)
+            best_s = s
             best_alpha = alpha
 
         pbar.set_description(
@@ -300,14 +297,14 @@ def awq(
         pbar.update()
 
     # Apply scale to module
-    for module in target.scale:
-        w = module.weight.data
+    for module in modules_to_scale:
+        w = module.weight.data.to(execution_device)
         w_s = w * best_s
         w_q = qcfg.quantize_tensor(w_s, *qcfg.compute_qparams(w_s))
-        module.weight.data = w_q
+        module.weight.data = w_q.to(storage_device)
 
     # Apply scale to parent op
-    parent = target.inverse_scale
+    parent = module_to_inverse_scale
     parent_op_name = parent.__class__.__name__.lower()
     if isinstance(parent, torch.nn.Linear):
         assert parent.out_features == inp_dim, (
