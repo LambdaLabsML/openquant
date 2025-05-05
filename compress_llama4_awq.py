@@ -117,61 +117,84 @@ def main():
 
     LOGGER.info(f"Loading {args.model}")
     attn_impl = get_attn_implementation()
-    
+
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         args.model, attn_implementation=attn_impl, torch_dtype="auto"
     )
 
     plan = make_awq_plan(model)
-    LOGGER.info(f"{len(plan)} quantization targets")
-    for i, target in enumerate(plan):
-        LOGGER.info(f"{i+1}. {target.names(model)}")
+    num_targets = 0
+    for _, targets in plan:
+        for target in targets:
+            LOGGER.info(f"{num_targets+1}. {target.names(model)}")
+            num_targets += 1
 
-    pbar = tqdm.tqdm(total=len(plan))
-    for target in plan:
-        pbar.set_description(f"Quantizing {target.names(model)}")
+    # TODO add hook to `subgraph = plan[0][0]` for grabbing input & run model
+    subgraph_inputs = []
+    for i in tqdm.tqdm(
+        range(0, len(ds), args.batch_size),
+        leave=False,
+        desc="Computing next layer inputs",
+    ):
+        uncollated_batch = ds[i : i + args.batch_size]
+        collated_batch = default_data_collator(uncollated_batch)
+        model_inputs = model.prepare_inputs_for_generation(**collated_batch)
+        model_inputs = {
+            k: v.to(device) if v is not None else v for k, v in model_inputs.items()
+        }
+        try:
+            _ = model(**model_inputs)
+        except ForwardPassEarlyStop:
+            pass
 
-        while args.batch_size > 0:
-            pre_free_memory, _ = torch.cuda.mem_get_info(device)
+    pbar = tqdm.tqdm(total=num_targets)
+    for subgraph, targets in plan:
+        for target in targets:
             gc.collect()
             torch.cuda.empty_cache()
-            post_free_memory, _ = torch.cuda.mem_get_info(device)
-            LOGGER.info(f"Cleared memory from {pre_free_memory * 1e-9:.1f}GB to {post_free_memory * 1e-9:.1f}GB")
+            LOGGER.debug(f"{torch.cuda.mem_get_info(device)[0] * 1e-9:.1f}GB available")
+
+            pbar.set_description(f"Quantizing {target.names(model)}")
 
             quantizer = AWQ(quant_config, target, execution_device=device)
-            handles: list["torch.utils.hooks.RemovableHandle"] = []
-            for m in quantizer.modules_to_scale:
-                handles.append(m.register_forward_pre_hook(quantizer.pre_forward_hook))
+            handles: list["torch.utils.hooks.RemovableHandle"] = [
+                m.register_forward_pre_hook(quantizer.pre_forward_hook)
+                for m in quantizer.modules_to_scale
+            ]
 
-            # calibrate
-            model = cpu_offload(model, execution_device=device)
+            subgraph.to(device)
+            for i in tqdm.tqdm(
+                range(0, len(ds), args.batch_size),
+                leave=False,
+                desc="Capturing layer inputs",
+            ):
+                try:
+                    _ = subgraph(**subgraph_inputs[i])
+                except ForwardPassEarlyStop:
+                    pass
+
+            for hook in handles:
+                hook.remove()
+
+            # do quantization
             try:
-                for i in tqdm.tqdm(
-                    range(0, len(ds), args.batch_size), leave=False, desc="Capturing layer inputs"
-                ):
-                    uncollated_batch = ds[i : i + args.batch_size]
-                    collated_batch = default_data_collator(uncollated_batch)
-                    model_inputs = model.prepare_inputs_for_generation(**collated_batch)
-                    model_inputs = {k: v.to(device) if v is not None else v for k, v in model_inputs.items()}
-                    try:
-                        _ = model(**model_inputs)
-                    except ForwardPassEarlyStop:
-                        pass
-                model = remove_hook_from_module(model, recurse=True)
-                for hook in handles:
-                    hook.remove()
-                break
+                quantizer.quantize()
             except torch.OutOfMemoryError:
-                args.batch_size //= 2
-                LOGGER.info(f"Out of memory error. Reducing batch size to {args.batch_size}")
-                model = remove_hook_from_module(model, recurse=True)
-                for hook in handles:
-                    hook.remove()
-        
-        assert args.batch_size > 0, "Not enough memory to run quantization"
+                LOGGER.warning(
+                    f"Can't run quantization while subgraph is on GPU, sending subgraph back to CPU"
+                )
+                subgraph.cpu()
+                quantizer.quantize()
 
-        # do quantization
-        quantizer.quantize()
+        subgraph.to(device)
+        for i in tqdm.tqdm(
+            range(0, len(ds), args.batch_size),
+            leave=False,
+            desc="Computing next layer inputs",
+        ):
+            subgraph_inputs[i] = subgraph(**subgraph_inputs[i])
+        subgraph.cpu()
+
         pbar.update()
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
@@ -186,54 +209,48 @@ from transformers.models.llama4.modeling_llama4 import (
     Llama4TextMoe,
     Llama4TextMLP,
     Llama4VisionEncoderLayer,
-    Llama4ForCausalLM
+    Llama4ForCausalLM,
 )
 
 
-def make_awq_plan(model) -> list[AWQTarget]:
+def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
     plan = []
 
     if isinstance(model, Llama4ForConditionalGeneration):
         encoder: Llama4VisionEncoderLayer
         for encoder in model.vision_model.model.layers:
-            plan.append(
-                dict(
+            subplan = [
+                AWQTarget(
                     inverse_scale=encoder.input_layernorm,
                     scale=[
                         encoder.self_attn.q_proj,
                         encoder.self_attn.k_proj,
                         encoder.self_attn.v_proj,
                     ],
-                )
-            )
-            plan.append(
-                dict(
+                ),
+                AWQTarget(
                     inverse_scale=encoder.self_attn.v_proj,
                     scale=[encoder.self_attn.o_proj],
-                )
-            )
-            plan.append(
-                dict(
+                ),
+                AWQTarget(
                     inverse_scale=encoder.post_attention_layernorm,
                     scale=[encoder.mlp.fc1],
-                )
-            )
-            plan.append(
-                dict(
+                ),
+                AWQTarget(
                     # TODO there is a GELU activation after fc1 & before fc2,
                     # which is roughly x * Phi(x), which I think means we scale the output of fc1?
                     inverse_scale=encoder.mlp.fc1,
                     scale=[encoder.mlp.fc2],
-                )
-            )
-        
+                ),
+            ]
+            plan.append((encoder, subplan))
+
         model = model.language_model
-        
 
     if isinstance(model, Llama4ForCausalLM):
         decoder: Llama4TextDecoderLayer
         for decoder in model.model.layers:
-            plan.append(
+            subplan = [
                 AWQTarget(
                     inverse_scale=decoder.input_layernorm,
                     scale=[
@@ -242,9 +259,12 @@ def make_awq_plan(model) -> list[AWQTarget]:
                         decoder.self_attn.v_proj,
                     ],
                 )
-            )
-            if decoder.self_attn.v_proj.out_features == decoder.self_attn.o_proj.in_features:
-                plan.append(
+            ]
+            if (
+                decoder.self_attn.v_proj.out_features
+                == decoder.self_attn.o_proj.in_features
+            ):
+                subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.self_attn.v_proj,
                         scale=[decoder.self_attn.o_proj],
@@ -253,7 +273,7 @@ def make_awq_plan(model) -> list[AWQTarget]:
             if decoder.is_moe_layer:
                 assert isinstance(decoder.feed_forward, Llama4TextMoe)
                 # NOTE: NOT quantizing experts yet
-                plan.append(
+                subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.post_attention_layernorm,
                         scale=[
@@ -263,15 +283,15 @@ def make_awq_plan(model) -> list[AWQTarget]:
                         ],
                     )
                 )
-                plan.append(
+                subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.feed_forward.shared_expert.up_proj,
-                        scale=[decoder.feed_forward.shared_expert.down_proj]
+                        scale=[decoder.feed_forward.shared_expert.down_proj],
                     )
                 )
             else:
                 assert isinstance(decoder.feed_forward, Llama4TextMLP)
-                plan.append(
+                subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.post_attention_layernorm,
                         scale=[
@@ -281,12 +301,13 @@ def make_awq_plan(model) -> list[AWQTarget]:
                     )
                 )
 
-                plan.append(
+                subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.feed_forward.up_proj,
                         scale=[decoder.feed_forward.down_proj],
                     )
                 )
+            plan.append((decoder, subplan))
 
     return plan
 
