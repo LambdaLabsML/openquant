@@ -190,15 +190,17 @@ class QuantConfig:
 
 
 class AWQTarget:
-    def __init__(self, *, inverse_scale: torch.nn.Module, scale: list[torch.nn.Module]):
+    def __init__(
+        self, *, inverse_scale: torch.nn.Module, scales: list[torch.nn.Module]
+    ):
         self.inverse_scale = inverse_scale
-        self.scale = scale
+        self.scales = scales
 
     def names(self, root: torch.nn.Module):
-        tmp = [""] * len(self.scale)
+        tmp = [""] * len(self.scales)
         for name, haystack in root.named_modules():
-            for i in range(len(self.scale)):
-                if haystack == self.scale[i]:
+            for i in range(len(self.scales)):
+                if haystack == self.scales[i]:
                     tmp[i] = name
                     break
         return tmp
@@ -206,19 +208,24 @@ class AWQTarget:
 
 class InputCatcher:
     def __init__(self, module: torch.nn.Module):
-        self.module = module
+        if not isinstance(module, list):
+            module = [module]
+        self.modules = module
         self.inputs = []
-        self.handle = self.module.register_forward_pre_hook(
-            self.pre_forward_hook, with_kwargs=True
-        )
+        self.handles = [
+            m.register_forward_pre_hook(self.pre_forward_hook, with_kwargs=True)
+            for m in self.modules
+        ]
 
     def pre_forward_hook(self, module, args, kwargs):
-        assert module == self.module
+        assert module in self.modules
         self.inputs.append([args, kwargs])
         raise ForwardPassEarlyStop()
 
     def remove_handle_and_get(self):
-        self.handle.remove()
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
         return self.inputs
 
 
@@ -261,7 +268,7 @@ def awq(
     # TODO filter out padded!!!
     for x in xs:
         # NOTE: x has shape [batch, inp_dim]
-        # NOTE: this is the group-wise functionality
+        # NOTE: this reshape is the group-wise functionality
         g_x = x.reshape(x.shape[0], -1, qcfg.group_size)
         s_x += g_x.abs().sum(0) / total_batch_size
     s_x = s_x.reshape(inp_dim)
@@ -332,14 +339,6 @@ def awq(
     else:
         raise NotImplementedError(f"Can't rescale previous op {parent}")
 
-    # Search for best clip
-    # apply_clip = not any(
-    #     p in self.name for p in ["q_", "k_", "query", "key", "Wqkv"]
-    # )
-    # if apply_clip:
-    #     for x in self.xs:
-    #         x.div_(best_s)
-
 
 def awq_transformers_quant_config(qcfg: QuantConfig) -> dict:
     return {
@@ -350,3 +349,7 @@ def awq_transformers_quant_config(qcfg: QuantConfig) -> dict:
         "version": "gemm",
         "modules_to_not_convert": None,
     }
+
+
+def pack(qcfg: QuantConfig, model):
+    raise NotImplementedError()

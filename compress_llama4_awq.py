@@ -20,6 +20,7 @@ from openquant import (
     ForwardPassEarlyStop,
     get_attn_implementation,
     AWQTarget,
+    pack,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -135,8 +136,11 @@ def main():
 
     pbar = tqdm.tqdm(total=num_targets)
     for subgraph, targets in plan:
+        # compute new inputs for this subgraph
         if last_subgraph is None:
-            input_catcher = InputCatcher(subgraph)
+            catcher = InputCatcher(subgraph)
+
+            # NOTE: llama4 specific
             model.model.embed_tokens.to(device)
             model.model.rotary_emb.to(device)
 
@@ -158,7 +162,7 @@ def main():
                     pass
             model.cpu()
 
-            subgraph_inputs = input_catcher.remove_handle_and_get()
+            subgraph_inputs = catcher.remove_handle_and_get()
         else:
             last_subgraph.to(device)
             for i in tqdm.tqdm(
@@ -176,13 +180,14 @@ def main():
 
         assert len(subgraph_inputs) == len(ds) // args.batch_size, len(subgraph_inputs)
 
+        # quantize each of the targets in this subgraph
         for target in targets:
             gc.collect()
             torch.cuda.empty_cache()
             LOGGER.debug(f"{torch.cuda.mem_get_info(device)[0] * 1e-9:.1f}GB available")
 
-            catchers = [InputCatcher(m) for m in target.scale]
-
+            # get inputs to target
+            catcher = InputCatcher(target.scales)
             subgraph.to(device)
             for a, k in tqdm.tqdm(
                 subgraph_inputs, leave=False, desc="Capturing layer inputs"
@@ -191,18 +196,34 @@ def main():
                     _ = subgraph(*a, **k)
                 except ForwardPassEarlyStop:
                     pass
+            target_inputs = catcher.remove_handle_and_get()
 
-            inputs = sum([catcher.remove_handle_and_get() for catcher in catchers], [])
+            # quantize it
             try:
-                awq(quant_config, target.scale, target.inverse_scale, device, inputs)
+                awq(
+                    quant_config,
+                    target.scales,
+                    target.inverse_scale,
+                    device,
+                    target_inputs,
+                )
             except torch.OutOfMemoryError:
                 LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                awq(quant_config, target.scale, target.inverse_scale, device, inputs)
+                awq(
+                    quant_config,
+                    target.scales,
+                    target.inverse_scale,
+                    device,
+                    target_inputs,
+                )
 
             pbar.update()
 
         last_subgraph = subgraph
+
+    LOGGER.info("Packing model...")
+    pack(quant_config, model)
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
     model.config.quantization_config = awq_transformers_quant_config(quant_config)
@@ -229,7 +250,7 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
             subplan = [
                 AWQTarget(
                     inverse_scale=encoder.input_layernorm,
-                    scale=[
+                    scales=[
                         encoder.self_attn.q_proj,
                         encoder.self_attn.k_proj,
                         encoder.self_attn.v_proj,
@@ -237,17 +258,17 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
                 ),
                 AWQTarget(
                     inverse_scale=encoder.self_attn.v_proj,
-                    scale=[encoder.self_attn.o_proj],
+                    scales=[encoder.self_attn.o_proj],
                 ),
                 AWQTarget(
                     inverse_scale=encoder.post_attention_layernorm,
-                    scale=[encoder.mlp.fc1],
+                    scales=[encoder.mlp.fc1],
                 ),
                 AWQTarget(
                     # TODO there is a GELU activation after fc1 & before fc2,
                     # which is roughly x * Phi(x), which I think means we scale the output of fc1?
                     inverse_scale=encoder.mlp.fc1,
-                    scale=[encoder.mlp.fc2],
+                    scales=[encoder.mlp.fc2],
                 ),
             ]
             plan.append((encoder, subplan))
@@ -260,7 +281,7 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
             subplan = [
                 AWQTarget(
                     inverse_scale=decoder.input_layernorm,
-                    scale=[
+                    scales=[
                         decoder.self_attn.q_proj,
                         decoder.self_attn.k_proj,
                         decoder.self_attn.v_proj,
@@ -274,7 +295,7 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
                 subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.self_attn.v_proj,
-                        scale=[decoder.self_attn.o_proj],
+                        scales=[decoder.self_attn.o_proj],
                     )
                 )
             if decoder.is_moe_layer:
@@ -283,7 +304,7 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
                 subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.post_attention_layernorm,
-                        scale=[
+                        scales=[
                             decoder.feed_forward.shared_expert.gate_proj,
                             decoder.feed_forward.shared_expert.up_proj,
                             decoder.feed_forward.router,
@@ -293,7 +314,7 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
                 subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.feed_forward.shared_expert.up_proj,
-                        scale=[decoder.feed_forward.shared_expert.down_proj],
+                        scales=[decoder.feed_forward.shared_expert.down_proj],
                     )
                 )
             else:
@@ -301,7 +322,7 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
                 subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.post_attention_layernorm,
-                        scale=[
+                        scales=[
                             decoder.feed_forward.gate_proj,
                             decoder.feed_forward.up_proj,
                         ],
@@ -311,7 +332,7 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
                 subplan.append(
                     AWQTarget(
                         inverse_scale=decoder.feed_forward.up_proj,
-                        scale=[decoder.feed_forward.down_proj],
+                        scales=[decoder.feed_forward.down_proj],
                     )
                 )
             plan.append((decoder, subplan))
