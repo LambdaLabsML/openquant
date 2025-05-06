@@ -3,6 +3,8 @@ import logging
 import tqdm
 import torch
 import torch.nn.functional as F
+import transformers
+from transformers import default_data_collator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -81,114 +83,6 @@ class QuantConfig:
         return scale.reshape(shape), zero.reshape(shape)
 
 
-# def extract_tensors(obj) -> list[torch.Tensor]:
-#     tensors = []
-#     if obj is None:
-#         pass
-#     elif isinstance(obj, torch.Tensor):
-#         tensors.append(obj)
-#     elif isinstance(obj, tuple):
-#         for o in obj:
-#             tensors.extend(extract_tensors(o))
-#     elif isinstance(obj, dict):
-#         for k, v in obj.items():
-#             tensors.extend(extract_tensors(v))
-#     else:
-#         pass
-#     return tensors
-
-
-# class GraphTracer:
-#     graph: torch.nn.Module
-
-#     parent: dict[str, list[str]]
-#     children: dict[str, list[str]]
-
-#     output_to_module_name: dict[weakref.ReferenceType, str]
-
-#     @classmethod
-#     def init_hooks(cls, graph: torch.nn.Module):
-#         for name, module in graph.named_modules():
-#             if len(name) == 0:
-#                 continue
-
-#             def make_pre_forward_hook(n):
-#                 def hook(module, args):
-#                     parents = []
-#                     for tensor in extract_tensors(args):
-#                         parent = GraphTracer.output_to_module_name.get(
-#                             weakref.ref(tensor)
-#                         )
-#                         if parent is not None:
-#                             parents.append(parent)
-
-#                     if len(parents) > 1:
-#                         raise NotImplementedError()
-#                     if len(parents) != 0:
-#                         GraphTracer.parent[n] = parents[0]
-#                         if parents[0] not in GraphTracer.children:
-#                             GraphTracer.children[parents[0]] = []
-#                         GraphTracer.children[parents[0]].append(n)
-
-#                 return hook
-
-#             def make_post_forward_hook(n):
-#                 def hook(module, args, output):
-#                     for tensor in extract_tensors(output):
-#                         GraphTracer.output_to_module_name[weakref.ref(tensor)] = n
-
-#                 return hook
-
-#             module.register_forward_pre_hook(make_pre_forward_hook(name))
-#             module.register_forward_hook(make_post_forward_hook(name))
-
-#         cls.parent = {}
-#         cls.children = {}
-#         cls.graph = graph
-#         cls.output_to_module_name = {}
-
-#     @classmethod
-#     def clear(cls):
-#         cls.output_to_module_name.clear()
-
-#     @classmethod
-#     def get_parent(cls, x: torch.Tensor) -> torch.nn.Module:
-#         name = cls.output_to_module_name[weakref.ref(x)]
-#         return name, cls.graph.get_submodule(name)
-
-
-# class LinearQuantizer:
-#     def __init__(
-#         self,
-#         qcfg: QuantConfig,
-#         name: str,
-#         module: torch.nn.Linear,
-#         execution_device: torch.device,
-#         storage_device: torch.device,
-#     ):
-#         super().__init__()
-#         assert isinstance(module, torch.nn.Linear)
-#         self.qcfg = qcfg
-#         self.name = name
-#         self.module = module
-#         self.execution_device = execution_device
-#         self.storage_device = storage_device
-#         self.out_dim, self.inp_dim = self.module.weight.shape
-
-#     def pre_forward_hook(self, *args, **kwargs):
-#         pass
-
-#     def post_forward_hook(self, *args, **kwargs):
-#         pass
-
-#     def quantize_module(self):
-#         raise NotImplementedError()
-
-#     @classmethod
-#     def get_transformers_quant_config(cls, qcfg: QuantConfig) -> dict:
-#         raise NotImplementedError()
-
-
 class AWQTarget:
     def __init__(
         self, *, inverse_scale: torch.nn.Module, scales: list[torch.nn.Module]
@@ -227,6 +121,46 @@ class InputCatcher:
             handle.remove()
         self.handles.clear()
         return self.inputs
+
+
+def init_subgraph_inputs(
+    model: "transformers.modeling_utils.PreTrainedModel",
+    subgraph: torch.nn.Module,
+    ds: list,
+    batch_size: int,
+    device: torch.device,
+) -> list:
+    catcher = InputCatcher(subgraph)
+    for i in tqdm.tqdm(
+        range(0, len(ds), batch_size),
+        leave=False,
+        desc="Capturing subgraph inputs",
+    ):
+        uncollated_batch = ds[i : i + batch_size]
+        collated_batch = default_data_collator(uncollated_batch)
+        model_inputs = model.prepare_inputs_for_generation(**collated_batch)
+        model_inputs = {
+            k: v.to(device) if v is not None else v for k, v in model_inputs.items()
+        }
+        try:
+            _ = model(**model_inputs)
+        except ForwardPassEarlyStop:
+            pass
+    return catcher.remove_handle_and_get()
+
+
+def update_subgraph_inputs(last_subgraph: torch.nn.Module, subgraph_inputs: list):
+    for i in tqdm.tqdm(
+        range(len(subgraph_inputs)),
+        leave=False,
+        desc="Capturing subgraph inputs",
+    ):
+        try:
+            subgraph_inputs[i][0] = last_subgraph(
+                *subgraph_inputs[i][0], **subgraph_inputs[i][1]
+            )
+        except ForwardPassEarlyStop:
+            pass
 
 
 @torch.inference_mode()

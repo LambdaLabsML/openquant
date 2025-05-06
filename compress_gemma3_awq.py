@@ -6,20 +6,9 @@ import gc
 import tqdm
 import torch
 import datasets
-from transformers import AutoTokenizer, AutoModelForCausalLM, default_data_collator
-from transformers.tokenization_utils import PreTrainedTokenizer
-from transformers.modeling_utils import PreTrainedModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from openquant import (
-    InputCatcher,
-    awq,
-    awq_transformers_quant_config,
-    QuantConfig,
-    ForwardPassEarlyStop,
-    get_attn_implementation,
-    AWQTarget,
-    pack,
-)
+from openquant import *
 
 LOGGER = logging.getLogger(__name__)
 
@@ -86,9 +75,7 @@ def main():
         f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
     )
 
-    tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
-        args.model, trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -118,7 +105,7 @@ def main():
     LOGGER.info(f"Loading {args.model}")
     attn_impl = get_attn_implementation()
 
-    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.model, attn_implementation=attn_impl, torch_dtype="auto"
     )
 
@@ -141,43 +128,14 @@ def main():
             model.model.embed_tokens.to(device)
             model.model.rotary_emb.to(device)
             model.model.rotary_emb_local.to(device)
-
-            catcher = InputCatcher(subgraph)
-            for i in tqdm.tqdm(
-                range(0, len(ds), args.batch_size),
-                leave=False,
-                desc="Capturing subgraph inputs",
-            ):
-                uncollated_batch = ds[i : i + args.batch_size]
-                collated_batch = default_data_collator(uncollated_batch)
-                model_inputs = model.prepare_inputs_for_generation(**collated_batch)
-                model_inputs = {
-                    k: v.to(device) if v is not None else v
-                    for k, v in model_inputs.items()
-                }
-                try:
-                    _ = model(**model_inputs)
-                except ForwardPassEarlyStop:
-                    pass
-            subgraph_inputs = catcher.remove_handle_and_get()
-
+            subgraph_inputs = init_subgraph_inputs(
+                model, subgraph, ds, args.batch_size, device
+            )
             model.cpu()
         else:
             last_subgraph.to(device)
-            for i in tqdm.tqdm(
-                range(len(subgraph_inputs)),
-                leave=False,
-                desc="Capturing subgraph inputs",
-            ):
-                try:
-                    subgraph_inputs[i][0] = last_subgraph(
-                        *subgraph_inputs[i][0], **subgraph_inputs[i][1]
-                    )
-                except ForwardPassEarlyStop:
-                    pass
+            update_subgraph_inputs(last_subgraph, subgraph_inputs)
             last_subgraph.cpu()
-
-        assert len(subgraph_inputs) == len(ds) // args.batch_size, len(subgraph_inputs)
 
         # quantize each of the targets in this subgraph
         for target in targets:
