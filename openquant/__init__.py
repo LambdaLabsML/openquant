@@ -232,9 +232,7 @@ class InputCatcher:
 @torch.inference_mode()
 def awq(
     qcfg: QuantConfig,
-    modules_to_scale: list[torch.nn.Linear],
-    module_to_inverse_scale: torch.nn.Module,
-    execution_device: torch.device,
+    target: AWQTarget,
     inputs,
     storage_device: torch.device = torch.device("cpu"),
     search_grid_size: int = 20,
@@ -244,16 +242,21 @@ def awq(
 
     https://arxiv.org/abs/2306.00978
     """
+    modules_to_scale: list[torch.nn.Linear] = target.scales
+    module_to_inverse_scale: torch.nn.Module = target.inverse_scale
+
     inp_dim = modules_to_scale[0].in_features
     assert inp_dim % qcfg.group_size == 0
     assert all(m.in_features == inp_dim for m in modules_to_scale)
 
-    xs = []
+    xs: list[torch.Tensor] = []
     for args, kwargs in inputs:
         assert len(args) == 1, len(args)
         assert isinstance(args[0], torch.Tensor)
         assert args[0].shape[-1] == inp_dim, args[0].shape
-        xs.append(args[0].reshape(-1, inp_dim).to(execution_device))
+        xs.append(args[0].reshape(-1, inp_dim))
+
+    execution_device: torch.device = xs[0].device
 
     total_batch_size = sum(x.shape[0] for x in xs)
     assert total_batch_size > 0

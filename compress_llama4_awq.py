@@ -200,23 +200,11 @@ def main():
 
             # quantize it
             try:
-                awq(
-                    quant_config,
-                    target.scales,
-                    target.inverse_scale,
-                    device,
-                    target_inputs,
-                )
+                awq(quant_config, target, target_inputs)
             except torch.OutOfMemoryError:
                 LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                awq(
-                    quant_config,
-                    target.scales,
-                    target.inverse_scale,
-                    device,
-                    target_inputs,
-                )
+                awq(quant_config, target, target_inputs)
 
             pbar.update()
 
