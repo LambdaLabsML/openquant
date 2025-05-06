@@ -306,11 +306,17 @@ def awq(
         pbar.update()
 
     # Apply scale to module
+    scales = []
+    zeros = []
     for module in modules_to_scale:
         w = module.weight.data.to(execution_device)
         w_s = w * best_s
-        w_q = qcfg.quantize_tensor(w_s, *qcfg.compute_qparams(w_s))
+        scale, zero = qcfg.compute_qparams(w_s)
+        w_q = qcfg.quantize_tensor(w_s, scale, zero)
         module.weight.data = w_q.to(module.weight.device)
+
+        scales.append(scale)
+        zeros.append(zero)
 
     # Apply scale to parent op
     parent = module_to_inverse_scale
@@ -341,6 +347,8 @@ def awq(
     else:
         raise NotImplementedError(f"Can't rescale previous op {parent}")
 
+    return scales, zeros
+
 
 def awq_transformers_quant_config(qcfg: QuantConfig) -> dict:
     return {
@@ -353,5 +361,108 @@ def awq_transformers_quant_config(qcfg: QuantConfig) -> dict:
     }
 
 
-def pack(qcfg: QuantConfig, model):
+def pack(
+    qcfg: QuantConfig,
+    model: torch.nn.Module,
+    targets: list[tuple[torch.nn.Linear, torch.Tensor, torch.Tensor]],
+    pack_dtype=torch.int32,
+):
+    pack_num_bits = pack_dtype.itemsize * 8
+    num_packed = pack_num_bits // qcfg.num_bits
+
+    named_targets = []
+    for target, scale, zero in targets:
+        for name, haystack in model.named_modules():
+            if haystack == target:
+                named_targets.append((name, target, scale, zero))
+                break
+
+    # reference code: https://github.com/casper-hansen/AutoAWQ/blob/main/awq/modules/linear/gemm.py#L172
+    for name, target, scale, zero in tqdm.tqdm(
+        named_targets, desc="Packing quantized layers", leave=False
+    ):
+        assert isinstance(target, torch.nn.Linear)
+
+        scaled_zeros: torch.Tensor = zero * scale
+        assert scaled_zeros.shape == [
+            target.in_features // qcfg.group_size
+        ], scaled_zeros.shape
+
+        intweight = []
+        for idx in range(target.in_features):
+            intweight.append(
+                torch.round(
+                    (target.weight.data[:, idx] + scaled_zeros[idx // qcfg.group_size])
+                    / scale[idx // qcfg.group_size]
+                ).to(torch.int)[:, None]
+            )
+        intweight = torch.cat(intweight, dim=1)
+        intweight = intweight.t().contiguous()
+        intweight = intweight.to(pack_dtype)
+
+        qweight = torch.zeros(
+            (
+                intweight.shape[0],
+                intweight.shape[1] // pack_num_bits * qcfg.num_bits,
+            ),
+            dtype=pack_dtype,
+            device=target.weight.device,
+        )
+        for col in range(intweight.shape[1] // num_packed):
+            if qcfg.num_bits == 4:
+                order_map = [0, 2, 4, 6, 1, 3, 5, 7]
+            else:
+                raise NotImplementedError("Only 4-bit are supported for now.")
+            for i in range(num_packed):
+                qweight_col = intweight[:, col * num_packed + order_map[i]]
+                qweight[:, col] |= qweight_col << (i * qcfg.num_bits)
+
+        zeros = zeros.to(dtype=pack_dtype)
+        qzeros = torch.zeros(
+            (zeros.shape[0], zeros.shape[1] // pack_num_bits * qcfg.num_bits),
+            dtype=torch.int32,
+            device=zeros.device,
+        )
+
+        for col in range(zeros.shape[1] // num_packed):
+            if qcfg.num_bits == 4:
+                order_map = [0, 2, 4, 6, 1, 3, 5, 7]
+            else:
+                raise NotImplementedError("Only 4-bit are supported for now.")
+            for i in range(num_packed):
+                qzero_col = zeros[:, col * num_packed + order_map[i]]
+                qzeros[:, col] |= qzero_col << (i * qcfg.num_bits)
+
+        setattr(
+            model,
+            name,
+            QuantizedLinear(
+                qweight,
+                qzeros,
+                scale.half(),
+                None if target.bias is None else target.bias.half(),
+            ),
+        )
+
     raise NotImplementedError()
+
+
+class QuantizedLinear(torch.nn.Module):
+    def __init__(
+        self,
+        qweight: torch.Tensor,
+        qzeros: torch.Tensor,
+        scales: torch.Tensor,
+        bias: torch.Tensor = None,
+    ):
+        super().__init__()
+        self.register_buffer("qweight", qweight)
+        self.register_buffer("qzeros", qzeros)
+        self.register_buffer("scales", scales)
+        if bias is not None:
+            self.register_buffer("bias", bias)
+        else:
+            self.bias = None
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError("This class is only used for serialization")

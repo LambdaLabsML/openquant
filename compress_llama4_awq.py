@@ -134,16 +134,17 @@ def main():
 
     last_subgraph = None
 
+    packing_targets = []
+
     pbar = tqdm.tqdm(total=num_targets)
     for subgraph, targets in plan:
         # compute new inputs for this subgraph
         if last_subgraph is None:
-            catcher = InputCatcher(subgraph)
-
             # NOTE: llama4 specific
             model.model.embed_tokens.to(device)
             model.model.rotary_emb.to(device)
 
+            catcher = InputCatcher(subgraph)
             for i in tqdm.tqdm(
                 range(0, len(ds), args.batch_size),
                 leave=False,
@@ -160,9 +161,9 @@ def main():
                     _ = model(**model_inputs)
                 except ForwardPassEarlyStop:
                     pass
-            model.cpu()
-
             subgraph_inputs = catcher.remove_handle_and_get()
+
+            model.cpu()
         else:
             last_subgraph.to(device)
             for i in tqdm.tqdm(
@@ -200,18 +201,21 @@ def main():
 
             # quantize it
             try:
-                awq(quant_config, target, target_inputs)
+                scales, zeros = awq(quant_config, target, target_inputs)
             except torch.OutOfMemoryError:
                 LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                awq(quant_config, target, target_inputs)
+                scales, zeros = awq(quant_config, target, target_inputs)
+
+            for m, scale, zero in zip(target.scales, scales, zeros):
+                packing_targets.append((m, scale, zero))
 
             pbar.update()
 
         last_subgraph = subgraph
 
     LOGGER.info("Packing model...")
-    pack(quant_config, model)
+    pack(quant_config, model, packing_targets)
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
     model.config.quantization_config = awq_transformers_quant_config(quant_config)
