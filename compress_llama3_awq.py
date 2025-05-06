@@ -9,8 +9,6 @@ import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM, default_data_collator
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.modeling_utils import PreTrainedModel
-from accelerate import cpu_offload
-from accelerate.hooks import remove_hook_from_module
 
 from openquant import (
     InputCatcher,
@@ -66,7 +64,6 @@ def main():
         type=int,
         help="Number of calibration samples to process at the same time.",
     )
-    parser.add_argument("--disable-cpu-offload", default=False, action="store_true")
     args = parser.parse_args()
 
     model_name = os.path.basename(args.model)
