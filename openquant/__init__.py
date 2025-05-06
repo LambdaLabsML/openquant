@@ -234,7 +234,6 @@ def awq(
     qcfg: QuantConfig,
     target: AWQTarget,
     inputs,
-    storage_device: torch.device = torch.device("cpu"),
     search_grid_size: int = 20,
 ):
     """
@@ -311,7 +310,7 @@ def awq(
         w = module.weight.data.to(execution_device)
         w_s = w * best_s
         w_q = qcfg.quantize_tensor(w_s, *qcfg.compute_qparams(w_s))
-        module.weight.data = w_q.to(storage_device)
+        module.weight.data = w_q.to(module.weight.device)
 
     # Apply scale to parent op
     parent = module_to_inverse_scale
