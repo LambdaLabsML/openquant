@@ -21,7 +21,7 @@ def main():
     parser.add_argument(
         "-m",
         "--model",
-        default="meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        default="Qwen/Qwen3-235B-A22B",
         help="The base model. Should be huggingface tag.",
     )
     parser.add_argument(
@@ -174,50 +174,22 @@ def main():
 
 
 def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
-    from transformers.models.llama4.modeling_llama4 import (
-        Llama4ForConditionalGeneration,
-        Llama4TextDecoderLayer,
-        Llama4TextMoe,
-        Llama4TextMLP,
-        Llama4VisionEncoderLayer,
-        Llama4ForCausalLM,
+    from transformers.models.qwen3.modeling_qwen3 import (
+        Qwen3ForCausalLM,
+        Qwen3DecoderLayer,
+    )
+
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+        Qwen3MoeForCausalLM,
+        Qwen3MoeDecoderLayer,
+        Qwen3MoeMLP,
+        Qwen3MoeSparseMoeBlock,
     )
 
     plan = []
 
-    if isinstance(model, Llama4ForConditionalGeneration):
-        encoder: Llama4VisionEncoderLayer
-        for encoder in model.vision_model.model.layers:
-            subplan = [
-                AWQTarget(
-                    inverse_scale=encoder.input_layernorm,
-                    scales=[
-                        encoder.self_attn.q_proj,
-                        encoder.self_attn.k_proj,
-                        encoder.self_attn.v_proj,
-                    ],
-                ),
-                AWQTarget(
-                    inverse_scale=encoder.self_attn.v_proj,
-                    scales=[encoder.self_attn.o_proj],
-                ),
-                AWQTarget(
-                    inverse_scale=encoder.post_attention_layernorm,
-                    scales=[encoder.mlp.fc1],
-                ),
-                AWQTarget(
-                    # TODO there is a GELU activation after fc1 & before fc2,
-                    # which is roughly x * Phi(x), which I think means we scale the output of fc1?
-                    inverse_scale=encoder.mlp.fc1,
-                    scales=[encoder.mlp.fc2],
-                ),
-            ]
-            plan.append((encoder, subplan))
-
-        model = model.language_model
-
-    if isinstance(model, Llama4ForCausalLM):
-        decoder: Llama4TextDecoderLayer
+    if isinstance(model, Qwen3ForCausalLM):
+        decoder: Qwen3DecoderLayer
         for decoder in model.model.layers:
             subplan = [
                 AWQTarget(
@@ -239,43 +211,75 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
                         scales=[decoder.self_attn.o_proj],
                     )
                 )
-            if decoder.is_moe_layer:
-                assert isinstance(decoder.feed_forward, Llama4TextMoe)
-                # TODO quantize experts
-                subplan.append(
-                    AWQTarget(
-                        inverse_scale=decoder.post_attention_layernorm,
-                        scales=[
-                            decoder.feed_forward.shared_expert.gate_proj,
-                            decoder.feed_forward.shared_expert.up_proj,
-                            decoder.feed_forward.router,
-                        ],
-                    )
+            subplan.append(
+                AWQTarget(
+                    inverse_scale=decoder.post_attention_layernorm,
+                    scales=[
+                        decoder.mlp.gate_proj,
+                        decoder.mlp.up_proj,
+                    ],
                 )
-                subplan.append(
-                    AWQTarget(
-                        inverse_scale=decoder.feed_forward.shared_expert.up_proj,
-                        scales=[decoder.feed_forward.shared_expert.down_proj],
-                    )
+            )
+
+            subplan.append(
+                AWQTarget(
+                    inverse_scale=decoder.mlp.up_proj,
+                    scales=[decoder.mlp.down_proj],
                 )
-            else:
-                assert isinstance(decoder.feed_forward, Llama4TextMLP)
+            )
+            plan.append((decoder, subplan))
+
+    if isinstance(model, Qwen3MoeForCausalLM):
+        decoder: Qwen3MoeDecoderLayer
+        for decoder in model.model.layers:
+            subplan = [
+                AWQTarget(
+                    inverse_scale=decoder.input_layernorm,
+                    scales=[
+                        decoder.self_attn.q_proj,
+                        decoder.self_attn.k_proj,
+                        decoder.self_attn.v_proj,
+                    ],
+                )
+            ]
+            if (
+                decoder.self_attn.v_proj.out_features
+                == decoder.self_attn.o_proj.in_features
+            ):
                 subplan.append(
                     AWQTarget(
-                        inverse_scale=decoder.post_attention_layernorm,
-                        scales=[
-                            decoder.feed_forward.gate_proj,
-                            decoder.feed_forward.up_proj,
-                        ],
+                        inverse_scale=decoder.self_attn.v_proj,
+                        scales=[decoder.self_attn.o_proj],
                     )
                 )
 
+            if isinstance(decoder.mlp, Qwen3MoeMLP):
                 subplan.append(
                     AWQTarget(
-                        inverse_scale=decoder.feed_forward.up_proj,
-                        scales=[decoder.feed_forward.down_proj],
+                        inverse_scale=decoder.post_attention_layernorm,
+                        scales=[
+                            decoder.mlp.gate_proj,
+                            decoder.mlp.up_proj,
+                        ],
                     )
                 )
+                subplan.append(
+                    AWQTarget(
+                        inverse_scale=decoder.mlp.up_proj,
+                        scales=[decoder.mlp.down_proj],
+                    )
+                )
+            elif isinstance(decoder.mlp, Qwen3MoeSparseMoeBlock):
+                subplan.append(
+                    AWQTarget(
+                        inverse_scale=decoder.post_attention_layernorm,
+                        scales=[decoder.mlp.gate],
+                    )
+                )
+                # TODO quantize the experts
+            else:
+                raise NotImplementedError(type(decoder.mlp))
+
             plan.append((decoder, subplan))
 
     return plan
