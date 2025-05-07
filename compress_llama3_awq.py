@@ -9,6 +9,7 @@ import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from openquant import *
+from openquant import awq
 
 LOGGER = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    quant_config = QuantConfig(num_bits=4, zero_point=not args.no_zero_point)
+    quant_config = awq.QuantConfig(num_bits=4, zero_point=not args.no_zero_point)
     LOGGER.info(
         f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
     )
@@ -172,15 +173,15 @@ def main():
         last_subgraph = subgraph
 
     LOGGER.info("Packing model...")
-    pack(quant_config, model, packing_targets)
+    awq.pack(quant_config, model, packing_targets)
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
-    model.config.quantization_config = awq_transformers_quant_config(quant_config)
+    model.config.quantization_config = awq.transformers_quant_config(quant_config)
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
 
 
-def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
+def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[awq.Target]]]:
     from transformers.models.llama.modeling_llama import (
         LlamaDecoderLayer,
         LlamaForCausalLM,
@@ -192,7 +193,7 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
     decoder: LlamaDecoderLayer
     for decoder in model.model.layers:
         subplan = [
-            AWQTarget(
+            awq.Target(
                 inverse_scale=decoder.input_layernorm,
                 scales=[
                     decoder.self_attn.q_proj,
@@ -206,13 +207,13 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
             == decoder.self_attn.o_proj.in_features
         ):
             subplan.append(
-                AWQTarget(
+                awq.Target(
                     inverse_scale=decoder.self_attn.v_proj,
                     scales=[decoder.self_attn.o_proj],
                 )
             )
         subplan.append(
-            AWQTarget(
+            awq.Target(
                 inverse_scale=decoder.post_attention_layernorm,
                 scales=[
                     decoder.mlp.gate_proj,
@@ -221,7 +222,7 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
             )
         )
         subplan.append(
-            AWQTarget(
+            awq.Target(
                 inverse_scale=decoder.mlp.up_proj,
                 scales=[decoder.mlp.down_proj],
             )
