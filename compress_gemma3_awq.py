@@ -53,6 +53,12 @@ def main():
         type=int,
         help="Number of calibration samples to process at the same time.",
     )
+    parser.add_argument(
+        "--no-zero-point",
+        action="store_true",
+        default=False,
+        help="Disable zero-point quantization",
+    )
     args = parser.parse_args()
 
     model_name = os.path.basename(args.model)
@@ -70,7 +76,7 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    quant_config = QuantConfig(num_bits=4)
+    quant_config = QuantConfig(num_bits=4, zero_point=not args.no_zero_point)
     LOGGER.info(
         f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
     )
