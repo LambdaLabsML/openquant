@@ -101,10 +101,8 @@ class AWQTarget:
 
 
 class InputCatcher:
-    def __init__(self, module: torch.nn.Module):
-        if not isinstance(module, list):
-            module = [module]
-        self.modules = module
+    def __init__(self, modules: list[torch.nn.Module]):
+        self.modules = modules
         self.inputs = []
         self.handles = [
             m.register_forward_pre_hook(self.pre_forward_hook, with_kwargs=True)
@@ -113,7 +111,7 @@ class InputCatcher:
 
     def pre_forward_hook(self, module, args, kwargs):
         assert module in self.modules
-        self.inputs.append([args, kwargs])
+        self.inputs.append([args_to(args, "cpu"), kwargs_to(kwargs, "cpu")])
         raise ForwardPassEarlyStop()
 
     def remove_handle_and_get(self):
@@ -130,7 +128,7 @@ def init_subgraph_inputs(
     batch_size: int,
     device: torch.device,
 ) -> list:
-    catcher = InputCatcher(subgraph)
+    catcher = InputCatcher([subgraph])
     for i in tqdm.tqdm(
         range(0, len(ds), batch_size),
         leave=False,
@@ -149,18 +147,46 @@ def init_subgraph_inputs(
     return catcher.remove_handle_and_get()
 
 
-def update_subgraph_inputs(last_subgraph: torch.nn.Module, subgraph_inputs: list):
+def update_subgraph_inputs(subgraph: torch.nn.Module, subgraph_inputs: list):
+    device = next(subgraph.parameters()).device
+
     for i in tqdm.tqdm(
         range(len(subgraph_inputs)),
         leave=False,
         desc="Capturing subgraph inputs",
     ):
         try:
-            subgraph_inputs[i][0] = last_subgraph(
-                *subgraph_inputs[i][0], **subgraph_inputs[i][1]
-            )
+            subgraph_inputs[i][0] = subgraph(
+                *args_to(subgraph_inputs[i][0], device),
+                **kwargs_to(subgraph_inputs[i][1], device),
+            ).cpu()
         except ForwardPassEarlyStop:
             pass
+
+
+def get_layer_inputs(
+    layers: list[torch.nn.Module], subgraph: torch.nn.Module, subgraph_inputs: list
+):
+    device = next(subgraph.parameters()).device
+
+    catcher = InputCatcher(layers)
+    for a, k in tqdm.tqdm(subgraph_inputs, leave=False, desc="Capturing layer inputs"):
+        try:
+            _ = subgraph(*args_to(a, device), **kwargs_to(k, device))
+        except ForwardPassEarlyStop:
+            pass
+    return catcher.remove_handle_and_get()
+
+
+def args_to(args: list, device: torch.device) -> list:
+    return [arg.to(device) if isinstance(arg, torch.Tensor) else arg for arg in args]
+
+
+def kwargs_to(kwargs: list, device: torch.device) -> list:
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in kwargs.items()
+    }
 
 
 @torch.inference_mode()

@@ -143,15 +143,11 @@ def main():
 
             # get inputs to target
             subgraph.to(device)
-            catcher = InputCatcher(target.scales)
-            for a, k in tqdm.tqdm(
-                subgraph_inputs, leave=False, desc="Capturing layer inputs"
-            ):
-                try:
-                    _ = subgraph(*a, **k)
-                except ForwardPassEarlyStop:
-                    pass
-            target_inputs = catcher.remove_handle_and_get()
+            target_inputs = get_layer_inputs(
+                target.scales,
+                subgraph,
+                subgraph_inputs,
+            )
 
             # quantize it
             try:
@@ -177,17 +173,16 @@ def main():
     tokenizer.save_pretrained(quant_name)
 
 
-from transformers.models.llama4.modeling_llama4 import (
-    Llama4ForConditionalGeneration,
-    Llama4TextDecoderLayer,
-    Llama4TextMoe,
-    Llama4TextMLP,
-    Llama4VisionEncoderLayer,
-    Llama4ForCausalLM,
-)
-
-
 def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
+    from transformers.models.llama4.modeling_llama4 import (
+        Llama4ForConditionalGeneration,
+        Llama4TextDecoderLayer,
+        Llama4TextMoe,
+        Llama4TextMLP,
+        Llama4VisionEncoderLayer,
+        Llama4ForCausalLM,
+    )
+
     plan = []
 
     if isinstance(model, Llama4ForConditionalGeneration):

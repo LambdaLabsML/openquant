@@ -144,16 +144,12 @@ def main():
             LOGGER.debug(f"{torch.cuda.mem_get_info(device)[0] * 1e-9:.1f}GB available")
 
             # get inputs to target
-            catcher = InputCatcher(target.scales)
             subgraph.to(device)
-            for a, k in tqdm.tqdm(
-                subgraph_inputs, leave=False, desc="Capturing layer inputs"
-            ):
-                try:
-                    _ = subgraph(*a, **k)
-                except ForwardPassEarlyStop:
-                    pass
-            target_inputs = catcher.remove_handle_and_get()
+            target_inputs = get_layer_inputs(
+                target.scales,
+                subgraph,
+                subgraph_inputs,
+            )
 
             # quantize it
             try:
@@ -179,13 +175,13 @@ def main():
     tokenizer.save_pretrained(quant_name)
 
 
-from transformers.models.gemma3.modeling_gemma3 import (
-    Gemma3ForCausalLM,
-    Gemma3DecoderLayer,
-)
-
-
 def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[AWQTarget]]]:
+    from transformers.models.gemma3.modeling_gemma3 import (
+        Gemma3ForCausalLM,
+        Gemma3DecoderLayer,
+    )
+
+    # TODO handle conditional generation with images
     assert isinstance(model, Gemma3ForCausalLM)
 
     plan = []
