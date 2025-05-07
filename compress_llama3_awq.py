@@ -116,7 +116,7 @@ def main():
         args.model, attn_implementation=attn_impl, torch_dtype="auto"
     )
 
-    plan = make_awq_plan(model)
+    plan = make_plan(model)
     num_targets = 0
     for _, targets in plan:
         for target in targets:
@@ -152,20 +152,20 @@ def main():
             # get inputs to target
             subgraph.to(device)
             target_inputs = get_layer_inputs(
-                target.scales,
+                target.ops,
                 subgraph,
                 subgraph_inputs,
             )
 
             # quantize it
             try:
-                scales, zeros = awq(quant_config, target, target_inputs)
+                scales, zeros = awq.quantize(quant_config, target, target_inputs)
             except torch.OutOfMemoryError:
                 LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                scales, zeros = awq(quant_config, target, target_inputs)
+                scales, zeros = awq.quantize(quant_config, target, target_inputs)
 
-            for m, scale, zero in zip(target.scales, scales, zeros):
+            for m, scale, zero in zip(target.ops, scales, zeros):
                 packing_targets.append((m, scale, zero))
 
             pbar.update()
@@ -181,7 +181,7 @@ def main():
     tokenizer.save_pretrained(quant_name)
 
 
-def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[awq.Target]]]:
+def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
     from transformers.models.llama.modeling_llama import (
         LlamaDecoderLayer,
         LlamaForCausalLM,
@@ -193,9 +193,9 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[awq.Target]]]:
     decoder: LlamaDecoderLayer
     for decoder in model.model.layers:
         subplan = [
-            awq.Target(
-                inverse_scale=decoder.input_layernorm,
-                scales=[
+            QuantTarget(
+                parent=decoder.input_layernorm,
+                ops=[
                     decoder.self_attn.q_proj,
                     decoder.self_attn.k_proj,
                     decoder.self_attn.v_proj,
@@ -207,24 +207,24 @@ def make_awq_plan(model) -> list[tuple[torch.nn.Module, list[awq.Target]]]:
             == decoder.self_attn.o_proj.in_features
         ):
             subplan.append(
-                awq.Target(
-                    inverse_scale=decoder.self_attn.v_proj,
-                    scales=[decoder.self_attn.o_proj],
+                QuantTarget(
+                    parent=decoder.self_attn.v_proj,
+                    ops=[decoder.self_attn.o_proj],
                 )
             )
         subplan.append(
-            awq.Target(
-                inverse_scale=decoder.post_attention_layernorm,
-                scales=[
+            QuantTarget(
+                parent=decoder.post_attention_layernorm,
+                ops=[
                     decoder.mlp.gate_proj,
                     decoder.mlp.up_proj,
                 ],
             )
         )
         subplan.append(
-            awq.Target(
-                inverse_scale=decoder.mlp.up_proj,
-                scales=[decoder.mlp.down_proj],
+            QuantTarget(
+                parent=decoder.mlp.up_proj,
+                ops=[decoder.mlp.down_proj],
             )
         )
         plan.append((decoder, subplan))

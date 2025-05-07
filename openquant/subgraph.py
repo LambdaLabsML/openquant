@@ -13,6 +13,21 @@ class ForwardPassEarlyStop(Exception):
     pass
 
 
+class QuantTarget:
+    def __init__(self, *, parent: torch.nn.Module, ops: list[torch.nn.Module]):
+        self.parent = parent
+        self.ops = ops
+
+    def names(self, root: torch.nn.Module):
+        tmp = [""] * len(self.ops)
+        for name, haystack in root.named_modules():
+            for i in range(len(self.ops)):
+                if haystack == self.ops[i]:
+                    tmp[i] = name
+                    break
+        return tmp
+
+
 class InputCatcher:
     def __init__(self, modules: list[torch.nn.Module]):
         self.modules = modules

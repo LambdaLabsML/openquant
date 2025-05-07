@@ -9,7 +9,7 @@ import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from openquant import *
-from openquant import awq
+from openquant import static_fp8
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ def main():
     parser.add_argument(
         "-m",
         "--model",
-        default="meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        default="meta-llama/Llama-3.3-70B-Instruct",
         help="The base model. Should be huggingface tag.",
     )
     parser.add_argument(
@@ -63,7 +63,7 @@ def main():
     args = parser.parse_args()
 
     model_name = os.path.basename(args.model)
-    quant_name = f"{model_name}-AWQ-Int4"
+    quant_name = f"{model_name}-F8"
 
     logging.basicConfig(level=logging.INFO)
 
@@ -77,9 +77,9 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    quant_config = awq.QuantConfig(num_bits=4, zero_point=not args.no_zero_point)
+    quant_config = static_fp8.QuantConfig(torch.float8_e4m3fn)
     LOGGER.info(
-        f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
+        f"Using {quant_config}. Value range is: [{quant_config.min_value}, {quant_config.max_value}]"
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -131,6 +131,7 @@ def main():
     for subgraph, targets in plan:
         # compute new inputs for this subgraph
         if last_subgraph is None:
+            # NOTE: llama3 specific
             model.model.embed_tokens.to(device)
             model.model.rotary_emb.to(device)
             subgraph_inputs = init_subgraph_inputs(
@@ -158,133 +159,77 @@ def main():
 
             # quantize it
             try:
-                scales, zeros = awq.quantize(quant_config, target, target_inputs)
+                scales = static_fp8.quantize(quant_config, target, target_inputs)
             except torch.OutOfMemoryError:
                 LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                scales, zeros = awq.quantize(quant_config, target, target_inputs)
+                scales = static_fp8.quantize(quant_config, target, target_inputs)
 
-            for m, scale, zero in zip(target.ops, scales, zeros):
-                packing_targets.append((m, scale, zero))
+            for m, scale in zip(target.ops, scales):
+                packing_targets.append((m, scale))
 
             pbar.update()
 
         last_subgraph = subgraph
 
     LOGGER.info("Packing model...")
-    awq.pack(quant_config, model, packing_targets)
+    static_fp8.pack(quant_config, model, packing_targets)
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
-    model.config.quantization_config = awq.transformers_quant_config(quant_config)
+    model.config.quantization_config = static_fp8.transformers_quant_config(
+        quant_config
+    )
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
 
 
 def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
-    from transformers.models.llama4.modeling_llama4 import (
-        Llama4ForConditionalGeneration,
-        Llama4TextDecoderLayer,
-        Llama4TextMoe,
-        Llama4TextMLP,
-        Llama4VisionEncoderLayer,
-        Llama4ForCausalLM,
+    from transformers.models.llama.modeling_llama import (
+        LlamaDecoderLayer,
+        LlamaForCausalLM,
     )
 
+    assert isinstance(model, LlamaForCausalLM)
+
     plan = []
-
-    if isinstance(model, Llama4ForConditionalGeneration):
-        encoder: Llama4VisionEncoderLayer
-        for encoder in model.vision_model.model.layers:
-            subplan = [
+    decoder: LlamaDecoderLayer
+    for decoder in model.model.layers:
+        subplan = [
+            QuantTarget(
+                parent=decoder.input_layernorm,
+                ops=[
+                    decoder.self_attn.q_proj,
+                    decoder.self_attn.k_proj,
+                    decoder.self_attn.v_proj,
+                ],
+            )
+        ]
+        if (
+            decoder.self_attn.v_proj.out_features
+            == decoder.self_attn.o_proj.in_features
+        ):
+            subplan.append(
                 QuantTarget(
-                    parent=encoder.input_layernorm,
-                    ops=[
-                        encoder.self_attn.q_proj,
-                        encoder.self_attn.k_proj,
-                        encoder.self_attn.v_proj,
-                    ],
-                ),
-                QuantTarget(
-                    parent=encoder.self_attn.v_proj,
-                    ops=[encoder.self_attn.o_proj],
-                ),
-                QuantTarget(
-                    parent=encoder.post_attention_layernorm,
-                    ops=[encoder.mlp.fc1],
-                ),
-                QuantTarget(
-                    # TODO there is a GELU activation after fc1 & before fc2,
-                    # which is roughly x * Phi(x), which I think means we scale the output of fc1?
-                    parent=encoder.mlp.fc1,
-                    ops=[encoder.mlp.fc2],
-                ),
-            ]
-            plan.append((encoder, subplan))
-
-        model = model.language_model
-
-    if isinstance(model, Llama4ForCausalLM):
-        decoder: Llama4TextDecoderLayer
-        for decoder in model.model.layers:
-            subplan = [
-                QuantTarget(
-                    parent=decoder.input_layernorm,
-                    ops=[
-                        decoder.self_attn.q_proj,
-                        decoder.self_attn.k_proj,
-                        decoder.self_attn.v_proj,
-                    ],
+                    parent=decoder.self_attn.v_proj,
+                    ops=[decoder.self_attn.o_proj],
                 )
-            ]
-            if (
-                decoder.self_attn.v_proj.out_features
-                == decoder.self_attn.o_proj.in_features
-            ):
-                subplan.append(
-                    QuantTarget(
-                        parent=decoder.self_attn.v_proj,
-                        ops=[decoder.self_attn.o_proj],
-                    )
-                )
-            if decoder.is_moe_layer:
-                assert isinstance(decoder.feed_forward, Llama4TextMoe)
-                # TODO quantize experts
-                subplan.append(
-                    QuantTarget(
-                        parent=decoder.post_attention_layernorm,
-                        ops=[
-                            decoder.feed_forward.shared_expert.gate_proj,
-                            decoder.feed_forward.shared_expert.up_proj,
-                            decoder.feed_forward.router,
-                        ],
-                    )
-                )
-                subplan.append(
-                    QuantTarget(
-                        parent=decoder.feed_forward.shared_expert.up_proj,
-                        ops=[decoder.feed_forward.shared_expert.down_proj],
-                    )
-                )
-            else:
-                assert isinstance(decoder.feed_forward, Llama4TextMLP)
-                subplan.append(
-                    QuantTarget(
-                        parent=decoder.post_attention_layernorm,
-                        ops=[
-                            decoder.feed_forward.gate_proj,
-                            decoder.feed_forward.up_proj,
-                        ],
-                    )
-                )
-
-                subplan.append(
-                    QuantTarget(
-                        parent=decoder.feed_forward.up_proj,
-                        ops=[decoder.feed_forward.down_proj],
-                    )
-                )
-            plan.append((decoder, subplan))
-
+            )
+        subplan.append(
+            QuantTarget(
+                parent=decoder.post_attention_layernorm,
+                ops=[
+                    decoder.mlp.gate_proj,
+                    decoder.mlp.up_proj,
+                ],
+            )
+        )
+        subplan.append(
+            QuantTarget(
+                parent=decoder.mlp.up_proj,
+                ops=[decoder.mlp.down_proj],
+            )
+        )
+        plan.append((decoder, subplan))
     return plan
 
 

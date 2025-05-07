@@ -4,6 +4,7 @@ import tqdm
 import torch
 import torch.nn.functional as F
 
+from .subgraph import QuantTarget
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,23 +33,21 @@ class QuantConfig:
     def __repr__(self):
         return f"QuantConfig(num_bits={self.num_bits}, zero_point={self.zero_point}, group_size={self.group_size})"
 
-    @torch.inference_mode()
     def quantize_tensor(self, x: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor):
         x = torch.clamp(torch.round(x / scale) + zero, self.min_int, self.max_int)
         return (x - zero) * scale
 
-    @torch.inference_mode()
     def dequantize_tensor(
         self, x: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor
     ):
         return (x - zero) * scale
 
-    @torch.inference_mode()
-    def compute_qparams(self, x: torch.Tensor):
+    def compute_qparams(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         shape = x.shape
 
         x = x.reshape(-1, self.group_size)
 
+        # TODO use quantile instead of amin/amax?
         if self.zero_point:
             min_val = x.amin(dim=1, keepdim=True).broadcast_to(-1, self.group_size)
             max_val = x.amax(dim=1, keepdim=True).broadcast_to(-1, self.group_size)
@@ -64,27 +63,10 @@ class QuantConfig:
         return scale.reshape(shape), zero.reshape(shape)
 
 
-class Target:
-    def __init__(
-        self, *, inverse_scale: torch.nn.Module, scales: list[torch.nn.Module]
-    ):
-        self.inverse_scale = inverse_scale
-        self.scales = scales
-
-    def names(self, root: torch.nn.Module):
-        tmp = [""] * len(self.scales)
-        for name, haystack in root.named_modules():
-            for i in range(len(self.scales)):
-                if haystack == self.scales[i]:
-                    tmp[i] = name
-                    break
-        return tmp
-
-
 @torch.inference_mode()
-def awq(
+def quantize(
     qcfg: QuantConfig,
-    target: Target,
+    target: QuantTarget,
     inputs,
     search_grid_size: int = 20,
 ):
@@ -93,8 +75,8 @@ def awq(
 
     https://arxiv.org/abs/2306.00978
     """
-    modules_to_scale: list[torch.nn.Linear] = target.scales
-    module_to_inverse_scale: torch.nn.Module = target.inverse_scale
+    modules_to_scale: list[torch.nn.Linear] = target.ops
+    module_to_inverse_scale: torch.nn.Module = target.parent
 
     inp_dim = modules_to_scale[0].in_features
     assert inp_dim % qcfg.group_size == 0
@@ -167,8 +149,8 @@ def awq(
         w_q = qcfg.quantize_tensor(w_s, scale, zero)
         module.weight.data = w_q.to(module.weight.device)
 
-        scales.append(scale)
-        zeros.append(zero)
+        scales.append(scale.cpu())
+        zeros.append(zero.cpu())
 
     # Apply scale to parent op
     parent = module_to_inverse_scale
