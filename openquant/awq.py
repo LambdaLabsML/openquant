@@ -181,7 +181,7 @@ def quantize(
     else:
         raise NotImplementedError(f"Can't rescale previous op {parent}")
 
-    return scales, zeros
+    return list(zip(modules_to_scale, scales, zeros))
 
 
 def transformers_quant_config(qcfg: QuantConfig) -> dict:

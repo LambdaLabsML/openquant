@@ -125,16 +125,13 @@ def main():
 
     last_subgraph = None
 
-    packing_targets = []
+    packs = []
 
     pbar = tqdm.tqdm(total=num_targets)
     for subgraph, targets in plan:
         # compute new inputs for this subgraph
         if last_subgraph is None:
-            # NOTE: gemma3 specific
-            model.model.embed_tokens.to(device)
-            model.model.rotary_emb.to(device)
-            model.model.rotary_emb_local.to(device)
+            head_to_device(model, device)
             subgraph_inputs = init_subgraph_inputs(
                 model, subgraph, ds, args.batch_size, device
             )
@@ -160,26 +157,30 @@ def main():
 
             # quantize it
             try:
-                scales, zeros = awq.quantize(quant_config, target, target_inputs)
+                packs.extend(awq.quantize(quant_config, target, target_inputs))
             except torch.OutOfMemoryError:
                 LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                scales, zeros = awq.quantize(quant_config, target, target_inputs)
-
-            for m, scale, zero in zip(target.ops, scales, zeros):
-                packing_targets.append((m, scale, zero))
+                packs.extend(awq.quantize(quant_config, target, target_inputs))
 
             pbar.update()
 
         last_subgraph = subgraph
 
     LOGGER.info("Packing model...")
-    awq.pack(quant_config, model, packing_targets)
+    awq.pack(quant_config, model, packs)
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
     model.config.quantization_config = awq.transformers_quant_config(quant_config)
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
+
+
+def head_to_device(model, device):
+    # NOTE: gemma3 specific
+    model.model.embed_tokens.to(device)
+    model.model.rotary_emb.to(device)
+    model.model.rotary_emb_local.to(device)
 
 
 def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:

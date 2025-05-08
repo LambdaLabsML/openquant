@@ -9,7 +9,7 @@ import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from openquant import *
-from openquant import static_fp8
+from openquant import f8_static
 
 LOGGER = logging.getLogger(__name__)
 
@@ -54,16 +54,10 @@ def main():
         type=int,
         help="Number of calibration samples to process at the same time.",
     )
-    parser.add_argument(
-        "--no-zero-point",
-        action="store_true",
-        default=False,
-        help="Disable zero-point quantization",
-    )
     args = parser.parse_args()
 
     model_name = os.path.basename(args.model)
-    quant_name = f"{model_name}-F8"
+    quant_name = f"{model_name}-F8-Static"
 
     logging.basicConfig(level=logging.INFO)
 
@@ -77,7 +71,7 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    quant_config = static_fp8.QuantConfig(torch.float8_e4m3fn)
+    quant_config = f8_static.QuantConfig(torch.float8_e4m3fn)
     LOGGER.info(
         f"Using {quant_config}. Value range is: [{quant_config.min_value}, {quant_config.max_value}]"
     )
@@ -125,15 +119,13 @@ def main():
 
     last_subgraph = None
 
-    packing_targets = []
+    packs = []
 
     pbar = tqdm.tqdm(total=num_targets)
     for subgraph, targets in plan:
         # compute new inputs for this subgraph
         if last_subgraph is None:
-            # NOTE: llama3 specific
-            model.model.embed_tokens.to(device)
-            model.model.rotary_emb.to(device)
+            head_to_device(model, device)
             subgraph_inputs = init_subgraph_inputs(
                 model, subgraph, ds, args.batch_size, device
             )
@@ -159,28 +151,28 @@ def main():
 
             # quantize it
             try:
-                scales = static_fp8.quantize(quant_config, target, target_inputs)
+                packs.extend(f8_static.quantize(quant_config, target, target_inputs))
             except torch.OutOfMemoryError:
                 LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                scales = static_fp8.quantize(quant_config, target, target_inputs)
-
-            for m, scale in zip(target.ops, scales):
-                packing_targets.append((m, scale))
+                packs.extend(f8_static.quantize(quant_config, target, target_inputs))
 
             pbar.update()
 
         last_subgraph = subgraph
 
     LOGGER.info("Packing model...")
-    static_fp8.pack(quant_config, model, packing_targets)
+    f8_static.pack(quant_config, model, packs)
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
-    model.config.quantization_config = static_fp8.transformers_quant_config(
-        quant_config
-    )
+    model.config.quantization_config = f8_static.transformers_quant_config(quant_config)
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
+
+
+def head_to_device(model, device):
+    model.model.embed_tokens.to(device)
+    model.model.rotary_emb.to(device)
 
 
 def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:

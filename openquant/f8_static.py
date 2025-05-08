@@ -69,7 +69,7 @@ def quantize(qcfg: QuantConfig, target: QuantTarget, inputs):
         m.weight.data = qcfg.quantize_tensor(w, scale).to(m.weight.device)
         weight_scales.append(scale.cpu())
 
-    return weight_scales, input_scales
+    return list(zip(modules_to_scale, weight_scales, input_scales))
 
 
 def transformers_quant_config(qcfg: QuantConfig) -> dict:
