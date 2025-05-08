@@ -60,7 +60,7 @@ def init_subgraph_inputs(
     for i in tqdm.tqdm(
         range(0, len(ds), batch_size),
         leave=False,
-        desc="Capturing subgraph inputs",
+        desc="Initializing subgraph inputs",
     ):
         uncollated_batch = ds[i : i + batch_size]
         collated_batch = default_data_collator(uncollated_batch)
@@ -81,13 +81,22 @@ def update_subgraph_inputs(subgraph: torch.nn.Module, subgraph_inputs: list):
     for i in tqdm.tqdm(
         range(len(subgraph_inputs)),
         leave=False,
-        desc="Capturing subgraph inputs",
+        desc="Updating subgraph inputs",
     ):
         try:
-            subgraph_inputs[i][0] = subgraph(
+            output = subgraph(
                 *args_to(subgraph_inputs[i][0], device),
                 **kwargs_to(subgraph_inputs[i][1], device),
-            ).cpu()
+            )
+            if isinstance(output, tuple):
+                output = tuple(
+                    o.cpu() if isinstance(o, torch.Tensor) else o for o in output
+                )
+            elif isinstance(output, torch.Tensor):
+                output = (output.cpu(),)
+            else:
+                raise NotImplementedError(type(output))
+            subgraph_inputs[i][0] = output
         except ForwardPassEarlyStop:
             pass
 

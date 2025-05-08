@@ -4,6 +4,7 @@ import tqdm
 import torch
 import torch.nn.functional as F
 
+from . import clean_memory
 from .subgraph import QuantTarget
 
 LOGGER = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ def quantize(
     qcfg: QuantConfig,
     target: QuantTarget,
     inputs,
+    device: torch.device,
     search_grid_size: int = 20,
 ):
     """
@@ -83,31 +85,28 @@ def quantize(
     assert all(m.in_features == inp_dim for m in modules_to_scale)
 
     xs: list[torch.Tensor] = []
-    for args, kwargs in inputs:
+    for args, kwargs in tqdm.tqdm(inputs, desc="Reshaping inputs", leave=False):
         assert len(args) == 1, len(args)
         assert isinstance(args[0], torch.Tensor)
         assert args[0].shape[-1] == inp_dim, args[0].shape
         xs.append(args[0].reshape(-1, inp_dim))
 
-    execution_device: torch.device = xs[0].device
-
     total_batch_size = sum(x.shape[0] for x in xs)
     assert total_batch_size > 0
 
-    w = torch.cat([m.weight for m in modules_to_scale]).to(execution_device)
-    b = None
-    if modules_to_scale[0].bias is not None:
-        b = torch.cat([m.bias for m in modules_to_scale]).to(execution_device)
+    w = torch.cat([m.weight for m in modules_to_scale]).to(device)
 
     # NOTE: input magnitude calculation (per input channel i.e. per `inp_dim`)
     s_x: torch.Tensor = 0
     # TODO filter out padded!!!
-    for x in xs:
+    for x in tqdm.tqdm(xs, desc="Computing input mangitude", leave=False):
         # NOTE: x has shape [batch, inp_dim]
         # NOTE: this reshape is the group-wise functionality
-        g_x = x.reshape(x.shape[0], -1, qcfg.group_size)
+        g_x = x.to(device).reshape(x.shape[0], -1, qcfg.group_size)
         s_x += g_x.abs().sum(0) / total_batch_size
     s_x = s_x.reshape(inp_dim)
+
+    clean_memory(device)
 
     # Find best scale
     best_loss = float("inf")
@@ -121,12 +120,14 @@ def quantize(
         w_s = w * s
         w_q = qcfg.quantize_tensor(w_s, *qcfg.compute_qparams(w_s))
 
+        loss_factor = 1 / (total_batch_size * w.shape[0])
         loss = 0
         for x in xs:
-            y = F.linear(x, w, bias=b)
-            y_q = F.linear(x / s, w_q, bias=b)
-            loss += (y - y_q).float().square().sum()
-        loss /= total_batch_size * w.shape[0]
+            x = x.to(device)
+            # NOTE: don't need to use bias because the bias will be unchanged and so will cancel each other out
+            y = F.linear(x, w)
+            y_q = F.linear(x / s, w_q)
+            loss += ((y - y_q).square() * loss_factor).sum()
 
         if loss < best_loss:
             best_loss = loss
@@ -138,12 +139,15 @@ def quantize(
             refresh=False,
         )
         pbar.update()
+    pbar.close()
+
+    LOGGER.info(f"best_loss={best_loss} @ alpha={best_alpha:.3f}")
 
     # Apply scale to module
     scales = []
     zeros = []
-    for module in modules_to_scale:
-        w = module.weight.data.to(execution_device)
+    for module in tqdm.tqdm(modules_to_scale, desc="Scaling modules", leave=False):
+        w = module.weight.data.to(device)
         w_s = w * best_s
         scale, zero = qcfg.compute_qparams(w_s)
         w_q = qcfg.quantize_tensor(w_s, scale, zero)

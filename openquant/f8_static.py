@@ -40,7 +40,7 @@ class QuantConfig:
 
 
 @torch.inference_mode()
-def quantize(qcfg: QuantConfig, target: QuantTarget, inputs):
+def quantize(qcfg: QuantConfig, target: QuantTarget, inputs, device: torch.device):
     modules_to_scale: list[torch.nn.Linear] = target.ops
 
     inp_dim = modules_to_scale[0].in_features

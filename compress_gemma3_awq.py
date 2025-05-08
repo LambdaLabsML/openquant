@@ -143,25 +143,22 @@ def main():
 
         # quantize each of the targets in this subgraph
         for target in targets:
-            gc.collect()
-            torch.cuda.empty_cache()
-            LOGGER.debug(f"{torch.cuda.mem_get_info(device)[0] * 1e-9:.1f}GB available")
+            LOGGER.info(f"Quantizing {target.names(model)}")
+            clean_memory(device)
 
             # get inputs to target
             subgraph.to(device)
-            target_inputs = get_layer_inputs(
-                target.ops,
-                subgraph,
-                subgraph_inputs,
-            )
+            target_inputs = get_layer_inputs(target.ops, subgraph, subgraph_inputs)
+
+            clean_memory(device)
 
             # quantize it
             try:
-                packs.extend(awq.quantize(quant_config, target, target_inputs))
+                packs.extend(awq.quantize(quant_config, target, target_inputs, device))
             except torch.OutOfMemoryError:
                 LOGGER.debug("Sending subgraph back to CPU")
                 subgraph.cpu()
-                packs.extend(awq.quantize(quant_config, target, target_inputs))
+                packs.extend(awq.quantize(quant_config, target, target_inputs, device))
 
             pbar.update()
 
