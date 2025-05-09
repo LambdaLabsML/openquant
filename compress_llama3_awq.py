@@ -120,51 +120,39 @@ def main():
     )
 
     plan = make_plan(model)
-    num_targets = 0
-    for _, targets in plan:
-        for target in targets:
-            LOGGER.info(f"{num_targets+1}. {target.names(model)}")
-            num_targets += 1
+    for i, target in enumerate(plan):
+        LOGGER.info(f"{i+1}. {target.names(model)}")
 
     last_subgraph = None
-
     packs = []
-
-    pbar = tqdm.tqdm(total=num_targets)
-    for subgraph, targets in plan:
+    for target in tqdm.tqdm(plan):
         # compute new inputs for this subgraph
         if last_subgraph is None:
             head_to_device(model, device)
             subgraph_inputs = init_subgraph_inputs(
-                model, subgraph, ds, args.batch_size, device
+                model, target.subgraph, ds, args.batch_size, device
             )
             model.cpu()
-        else:
+        elif last_subgraph != target.subgraph:
             last_subgraph.to(device)
             update_subgraph_inputs(last_subgraph, subgraph_inputs)
             last_subgraph.cpu()
 
-        # quantize each of the targets in this subgraph
-        for target in targets:
-            LOGGER.info(f"Quantizing {target.names(model)}")
-            subgraph.to(device)
+        LOGGER.info(f"Quantizing {target.names(model)}")
+        target.subgraph.to(device)
 
-            # get inputs to target
-            target_inputs = get_layer_inputs(target.ops, subgraph, subgraph_inputs)
+        # get inputs to target
+        target_inputs = get_layer_inputs(target.ops, target.subgraph, subgraph_inputs)
 
-            # quantize it
-            try:
-                packs.extend(awq.quantize(quant_config, target, target_inputs, device))
-            except torch.OutOfMemoryError:
-                LOGGER.error(
-                    "Sending subgraph back to CPU - could reduce batch size further to reduce device transfer"
-                )
-                subgraph.cpu()
-                packs.extend(awq.quantize(quant_config, target, target_inputs, device))
+        # quantize it
+        try:
+            packs.extend(awq.quantize(quant_config, target, target_inputs, device))
+        except torch.OutOfMemoryError:
+            LOGGER.error("Sending subgraph back to CPU - reduce batch size to avoid")
+            target.subgraph.cpu()
+            packs.extend(awq.quantize(quant_config, target, target_inputs, device))
 
-            pbar.update()
-
-        last_subgraph = subgraph
+        last_subgraph = target.subgraph
 
     LOGGER.info("Packing model...")
     awq.pack(quant_config, model, packs)
@@ -180,7 +168,7 @@ def head_to_device(model, device):
     model.model.rotary_emb.to(device)
 
 
-def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
+def make_plan(model) -> list[QuantTarget]:
     from transformers.models.llama.modeling_llama import (
         LlamaDecoderLayer,
         LlamaForCausalLM,
@@ -191,8 +179,9 @@ def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
     plan = []
     decoder: LlamaDecoderLayer
     for decoder in model.model.layers:
-        subplan = [
+        plan.append(
             QuantTarget(
+                subgraph=decoder,
                 parent=decoder.input_layernorm,
                 ops=[
                     decoder.self_attn.q_proj,
@@ -200,19 +189,21 @@ def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
                     decoder.self_attn.v_proj,
                 ],
             )
-        ]
+        )
         if (
             decoder.self_attn.v_proj.out_features
             == decoder.self_attn.o_proj.in_features
         ):
-            subplan.append(
+            plan.append(
                 QuantTarget(
+                    subgraph=decoder,
                     parent=decoder.self_attn.v_proj,
                     ops=[decoder.self_attn.o_proj],
                 )
             )
-        subplan.append(
+        plan.append(
             QuantTarget(
+                subgraph=decoder,
                 parent=decoder.post_attention_layernorm,
                 ops=[
                     decoder.mlp.gate_proj,
@@ -220,13 +211,13 @@ def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
                 ],
             )
         )
-        subplan.append(
+        plan.append(
             QuantTarget(
+                subgraph=decoder,
                 parent=decoder.mlp.up_proj,
                 ops=[decoder.mlp.down_proj],
             )
         )
-        plan.append((decoder, subplan))
     return plan
 
 

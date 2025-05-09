@@ -16,7 +16,14 @@ class ForwardPassEarlyStop(Exception):
 
 
 class QuantTarget:
-    def __init__(self, *, parent: torch.nn.Module, ops: list[torch.nn.Module]):
+    def __init__(
+        self,
+        *,
+        root: torch.nn.Module,
+        parent: torch.nn.Module,
+        ops: list[torch.nn.Module]
+    ):
+        self.subgraph = root
         self.parent = parent
         self.ops = ops
 

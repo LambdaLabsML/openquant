@@ -120,49 +120,39 @@ def main():
     )
 
     plan = make_plan(model)
-    num_targets = 0
-    for _, targets in plan:
-        for target in targets:
-            LOGGER.info(f"{num_targets+1}. {target.names(model)}")
-            num_targets += 1
+    for i, target in enumerate(plan):
+        LOGGER.info(f"{i+1}. {target.names(model)}")
 
     last_subgraph = None
-
     packs = []
-
-    pbar = tqdm.tqdm(total=num_targets)
-    for subgraph, targets in plan:
+    for target in tqdm.tqdm(plan):
         # compute new inputs for this subgraph
         if last_subgraph is None:
             head_to_device(model, device)
             subgraph_inputs = init_subgraph_inputs(
-                model, subgraph, ds, args.batch_size, device
+                model, target.subgraph, ds, args.batch_size, device
             )
             model.cpu()
-        else:
+        elif last_subgraph != target.subgraph:
             last_subgraph.to(device)
             update_subgraph_inputs(last_subgraph, subgraph_inputs)
             last_subgraph.cpu()
 
-        # quantize each of the targets in this subgraph
-        for target in targets:
-            LOGGER.info(f"Quantizing {target.names(model)}")
-            subgraph.to(device)
+        LOGGER.info(f"Quantizing {target.names(model)}")
+        target.subgraph.to(device)
 
-            # get inputs to target
-            target_inputs = get_layer_inputs(target.ops, subgraph, subgraph_inputs)
+        # get inputs to target
+        target_inputs = get_layer_inputs(target.ops, target.subgraph, subgraph_inputs)
 
-            # quantize it
-            try:
-                packs.extend(awq.quantize(quant_config, target, target_inputs, device))
-            except torch.OutOfMemoryError:
-                LOGGER.debug("Sending subgraph back to CPU")
-                subgraph.cpu()
-                packs.extend(awq.quantize(quant_config, target, target_inputs, device))
+        # quantize it
+        try:
+            packs.extend(awq.quantize(quant_config, target, target_inputs, device))
+        except torch.OutOfMemoryError:
+            LOGGER.error("Sending subgraph back to CPU - reduce batch size to avoid")
+            target.subgraph.cpu()
+            packs.extend(awq.quantize(quant_config, target, target_inputs, device))
 
-            pbar.update()
-
-        last_subgraph = subgraph
+        last_subgraph = target.subgraph
 
     LOGGER.info("Packing model...")
     awq.pack(quant_config, model, packs)
@@ -178,7 +168,7 @@ def head_to_device(model, device):
     model.model.rotary_emb.to(device)
 
 
-def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
+def make_plan(model) -> list[QuantTarget]:
     from transformers.models.llama4.modeling_llama4 import (
         Llama4ForConditionalGeneration,
         Llama4TextDecoderLayer,
@@ -193,39 +183,44 @@ def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
     if isinstance(model, Llama4ForConditionalGeneration):
         encoder: Llama4VisionEncoderLayer
         for encoder in model.vision_model.model.layers:
-            subplan = [
-                QuantTarget(
-                    parent=encoder.input_layernorm,
-                    ops=[
-                        encoder.self_attn.q_proj,
-                        encoder.self_attn.k_proj,
-                        encoder.self_attn.v_proj,
-                    ],
-                ),
-                QuantTarget(
-                    parent=encoder.self_attn.v_proj,
-                    ops=[encoder.self_attn.o_proj],
-                ),
-                QuantTarget(
-                    parent=encoder.post_attention_layernorm,
-                    ops=[encoder.mlp.fc1],
-                ),
-                QuantTarget(
-                    # TODO there is a GELU activation after fc1 & before fc2,
-                    # which is roughly x * Phi(x), which I think means we scale the output of fc1?
-                    parent=encoder.mlp.fc1,
-                    ops=[encoder.mlp.fc2],
-                ),
-            ]
-            plan.append((encoder, subplan))
-
+            plan.extend(
+                [
+                    QuantTarget(
+                        subgraph=encoder,
+                        parent=encoder.input_layernorm,
+                        ops=[
+                            encoder.self_attn.q_proj,
+                            encoder.self_attn.k_proj,
+                            encoder.self_attn.v_proj,
+                        ],
+                    ),
+                    QuantTarget(
+                        subgraph=encoder,
+                        parent=encoder.self_attn.v_proj,
+                        ops=[encoder.self_attn.o_proj],
+                    ),
+                    QuantTarget(
+                        subgraph=encoder,
+                        parent=encoder.post_attention_layernorm,
+                        ops=[encoder.mlp.fc1],
+                    ),
+                    QuantTarget(
+                        # TODO there is a GELU activation after fc1 & before fc2,
+                        # which is roughly x * Phi(x), which I think means we scale the output of fc1?
+                        subgraph=encoder,
+                        parent=encoder.mlp.fc1,
+                        ops=[encoder.mlp.fc2],
+                    ),
+                ]
+            )
         model = model.language_model
 
     if isinstance(model, Llama4ForCausalLM):
         decoder: Llama4TextDecoderLayer
         for decoder in model.model.layers:
-            subplan = [
+            plan.append(
                 QuantTarget(
+                    subgraph=decoder,
                     parent=decoder.input_layernorm,
                     ops=[
                         decoder.self_attn.q_proj,
@@ -233,13 +228,14 @@ def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
                         decoder.self_attn.v_proj,
                     ],
                 )
-            ]
+            )
             if (
                 decoder.self_attn.v_proj.out_features
                 == decoder.self_attn.o_proj.in_features
             ):
-                subplan.append(
+                plan.append(
                     QuantTarget(
+                        subgraph=decoder,
                         parent=decoder.self_attn.v_proj,
                         ops=[decoder.self_attn.o_proj],
                     )
@@ -247,8 +243,9 @@ def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
             if decoder.is_moe_layer:
                 assert isinstance(decoder.feed_forward, Llama4TextMoe)
                 # TODO quantize experts
-                subplan.append(
+                plan.append(
                     QuantTarget(
+                        subgraph=decoder,
                         parent=decoder.post_attention_layernorm,
                         ops=[
                             decoder.feed_forward.shared_expert.gate_proj,
@@ -257,16 +254,18 @@ def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
                         ],
                     )
                 )
-                subplan.append(
+                plan.append(
                     QuantTarget(
+                        subgraph=decoder,
                         parent=decoder.feed_forward.shared_expert.up_proj,
                         ops=[decoder.feed_forward.shared_expert.down_proj],
                     )
                 )
             else:
                 assert isinstance(decoder.feed_forward, Llama4TextMLP)
-                subplan.append(
+                plan.append(
                     QuantTarget(
+                        subgraph=decoder,
                         parent=decoder.post_attention_layernorm,
                         ops=[
                             decoder.feed_forward.gate_proj,
@@ -274,14 +273,13 @@ def make_plan(model) -> list[tuple[torch.nn.Module, list[QuantTarget]]]:
                         ],
                     )
                 )
-
-                subplan.append(
+                plan.append(
                     QuantTarget(
+                        subgraph=decoder,
                         parent=decoder.feed_forward.up_proj,
                         ops=[decoder.feed_forward.down_proj],
                     )
                 )
-            plan.append((decoder, subplan))
 
     return plan
 
