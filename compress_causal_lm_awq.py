@@ -1,7 +1,6 @@
 import argparse
 import os
 import logging
-import gc
 
 import tqdm
 import torch
@@ -9,7 +8,7 @@ import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from openquant import *
-from openquant import awq
+from openquant import awq, models
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,8 +21,8 @@ def main():
     parser.add_argument(
         "-m",
         "--model",
-        default="meta-llama/Llama-3.3-70B-Instruct",
         help="The base model. Should be huggingface tag.",
+        required=True,
     )
     parser.add_argument(
         "--dataset", default="HuggingFaceH4/ultrachat_200k", help="Calibration data"
@@ -119,7 +118,7 @@ def main():
         use_cache=False,
     )
 
-    plan = make_plan(model)
+    plan = models.make_plan(model)
     for i, target in enumerate(plan):
         LOGGER.info(f"{i+1}. {target.names(model)}")
 
@@ -128,7 +127,7 @@ def main():
     for target in tqdm.tqdm(plan):
         # compute new inputs for this subgraph
         if last_subgraph is None:
-            head_to_device(model, device)
+            models.head_to_device(model, device)
             subgraph_inputs = init_subgraph_inputs(
                 model, target.subgraph, ds, args.batch_size, device
             )
@@ -161,64 +160,6 @@ def main():
     model.config.quantization_config = awq.transformers_quant_config(quant_config)
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
-
-
-def head_to_device(model, device):
-    model.model.embed_tokens.to(device)
-    model.model.rotary_emb.to(device)
-
-
-def make_plan(model) -> list[QuantTarget]:
-    from transformers.models.llama.modeling_llama import (
-        LlamaDecoderLayer,
-        LlamaForCausalLM,
-    )
-
-    assert isinstance(model, LlamaForCausalLM)
-
-    plan = []
-    decoder: LlamaDecoderLayer
-    for decoder in model.model.layers:
-        plan.append(
-            QuantTarget(
-                subgraph=decoder,
-                parent=decoder.input_layernorm,
-                ops=[
-                    decoder.self_attn.q_proj,
-                    decoder.self_attn.k_proj,
-                    decoder.self_attn.v_proj,
-                ],
-            )
-        )
-        if (
-            decoder.self_attn.v_proj.out_features
-            == decoder.self_attn.o_proj.in_features
-        ):
-            plan.append(
-                QuantTarget(
-                    subgraph=decoder,
-                    parent=decoder.self_attn.v_proj,
-                    ops=[decoder.self_attn.o_proj],
-                )
-            )
-        plan.append(
-            QuantTarget(
-                subgraph=decoder,
-                parent=decoder.post_attention_layernorm,
-                ops=[
-                    decoder.mlp.gate_proj,
-                    decoder.mlp.up_proj,
-                ],
-            )
-        )
-        plan.append(
-            QuantTarget(
-                subgraph=decoder,
-                parent=decoder.mlp.up_proj,
-                ops=[decoder.mlp.down_proj],
-            )
-        )
-    return plan
 
 
 if __name__ == "__main__":
