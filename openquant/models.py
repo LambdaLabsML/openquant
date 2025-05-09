@@ -9,7 +9,7 @@ def head_to_device(model, device):
 
 
 def make_plan(model) -> list[QuantTarget]:
-    REGISTRY[type(model)].plan(model)
+    return REGISTRY[type(model)].plan(model)
 
 
 class Llama:
@@ -42,8 +42,8 @@ class Llama:
                 )
             )
             if (
-                decoder.self_attn.v_proj.out_features
-                == decoder.self_attn.o_proj.in_features
+                decoder.self_attn.o_proj.in_features
+                in decoder.self_attn.v_proj.weight.shape
             ):
                 plan.append(
                     QuantTarget(
@@ -104,8 +104,8 @@ class Gemma3:
                 )
             )
             if (
-                decoder.self_attn.v_proj.out_features
-                == decoder.self_attn.o_proj.in_features
+                decoder.self_attn.o_proj.in_features
+                in decoder.self_attn.v_proj.weight.shape
             ):
                 plan.append(
                     QuantTarget(
@@ -203,8 +203,8 @@ class Llama4:
                     )
                 )
                 if (
-                    decoder.self_attn.v_proj.out_features
-                    == decoder.self_attn.o_proj.in_features
+                    decoder.self_attn.o_proj.in_features
+                    in decoder.self_attn.v_proj.weight.shape
                 ):
                     plan.append(
                         QuantTarget(
@@ -294,8 +294,8 @@ class Qwen3:
                     )
                 )
                 if (
-                    decoder.self_attn.v_proj.out_features
-                    == decoder.self_attn.o_proj.in_features
+                    decoder.self_attn.o_proj.in_features
+                    in decoder.self_attn.v_proj.weight.shape
                 ):
                     plan.append(
                         QuantTarget(
@@ -338,8 +338,8 @@ class Qwen3:
                 )
 
                 if (
-                    decoder.self_attn.v_proj.out_features
-                    == decoder.self_attn.o_proj.in_features
+                    decoder.self_attn.o_proj.in_features
+                    in decoder.self_attn.v_proj.weight.shape
                 ):
                     plan.append(
                         QuantTarget(

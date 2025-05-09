@@ -145,13 +145,15 @@ def main():
 
         # quantize it
         try:
-            packs.extend(awq.quantize(quant_config, target, target_inputs, device))
+            packs.append(awq.quantize(quant_config, target, target_inputs, device))
         except torch.OutOfMemoryError:
             LOGGER.error("Sending subgraph back to CPU - reduce batch size to avoid")
             target.subgraph.cpu()
-            packs.extend(awq.quantize(quant_config, target, target_inputs, device))
+            packs.append(awq.quantize(quant_config, target, target_inputs, device))
 
         last_subgraph = target.subgraph
+
+    last_subgraph.cpu()
 
     LOGGER.info("Packing model...")
     awq.pack(quant_config, model, packs)

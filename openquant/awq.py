@@ -34,34 +34,50 @@ class QuantConfig:
     def __repr__(self):
         return f"QuantConfig(num_bits={self.num_bits}, zero_point={self.zero_point}, group_size={self.group_size})"
 
-    def quantize_tensor(self, x: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor):
-        x = torch.clamp(torch.round(x / scale) + zero, self.min_int, self.max_int)
-        return (x - zero) * scale
+    def qdq_tensor(self, x: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor):
+        assert x.ndim == 2
+        shape = x.shape
+        x = x.reshape(shape[0], shape[1] // self.group_size, self.group_size)
+        scale = scale.unsqueeze(-1)
+        zero = zero.unsqueeze(-1)
 
-    def dequantize_tensor(
-        self, x: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor
-    ):
-        return (x - zero) * scale
+        # NOTE: quantize
+        x = torch.clamp(torch.round(x / scale) + zero, self.min_int, self.max_int)
+        # NOTE: dequantize
+        x = (x - zero) * scale
+
+        return x.reshape(shape)
+
+    def quantize_tensor(self, x: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor):
+        assert x.ndim == 2
+        shape = x.shape
+        x = x.reshape(shape[0], shape[1] // self.group_size, self.group_size)
+        scale = scale.unsqueeze(-1)
+        zero = zero.unsqueeze(-1)
+
+        # NOTE: quantize
+        x = torch.clamp(torch.round(x / scale) + zero, self.min_int, self.max_int)
+
+        return x.reshape(shape)
 
     def compute_qparams(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        assert x.ndim == 2 and x.shape[-1] % self.group_size == 0
         shape = x.shape
 
         x = x.reshape(-1, self.group_size)
 
         # TODO use quantile instead of amin/amax?
         if self.zero_point:
-            min_val = x.amin(dim=1, keepdim=True).broadcast_to(-1, self.group_size)
-            max_val = x.amax(dim=1, keepdim=True).broadcast_to(-1, self.group_size)
+            min_val = x.amin(dim=1)
+            max_val = x.amax(dim=1)
             scale = (max_val - min_val) / self.max_int
             zero = (-torch.round(min_val / scale)).clamp(self.min_int, self.max_int)
         else:
-            max_val = (
-                x.abs().amax(dim=1, keepdim=True).broadcast_to(-1, self.group_size)
-            )
+            max_val = x.abs().amax(dim=1)
             scale = max_val / self.max_int
             zero = torch.zeros_like(max_val)
 
-        return scale.reshape(shape), zero.reshape(shape)
+        return scale.reshape(shape[0], -1), zero.reshape(shape[0], -1)
 
 
 @torch.inference_mode()
@@ -125,14 +141,14 @@ def quantize(
         s[torch.isinf(s) | torch.isnan(s)] = 1
 
         w_s = w * s
-        w_q = qcfg.quantize_tensor(w_s, *qcfg.compute_qparams(w_s))
+        w_qdq = qcfg.qdq_tensor(w_s, *qcfg.compute_qparams(w_s))
 
         loss = 0
         for x in xs:
             x = x.to(device)
             # NOTE: don't need to use bias because the bias will be unchanged and so will cancel each other out
             y = F.linear(x, w).float()
-            y_q = F.linear(x / s, w_q).float()
+            y_q = F.linear(x / s, w_qdq).float()
             loss += (y - y_q).square().sum()
         loss /= total_batch_size * w.shape[0]
         LOGGER.debug(f"loss={loss} @ alpha={alpha:.3f}")
@@ -148,129 +164,150 @@ def quantize(
     scales = []
     zeros = []
     for module in tqdm.tqdm(modules_to_scale, desc="Scaling modules", leave=False):
-        w = module.weight.data.to(device)
-        w_s = w * best_s
+        w_s = module.weight.data.to(device) * best_s
         scale, zero = qcfg.compute_qparams(w_s)
-        w_q = qcfg.quantize_tensor(w_s, scale, zero)
-        module.weight.data = w_q.to(module.weight.device)
-
         scales.append(scale.cpu())
         zeros.append(zero.cpu())
 
-    # Apply scale to parent op
-    parent = module_to_inverse_scale
-    parent_op_name = parent.__class__.__name__.lower()
-    if isinstance(parent, torch.nn.Linear):
-        assert parent.out_features == inp_dim, (
-            inp_dim,
-            parent.in_features,
-            parent.out_features,
-        )
-        assert parent.weight.shape[0] == inp_dim, (inp_dim, parent.weight.shape)
-        parent.weight.div_(best_s.view(inp_dim, 1))
-        if parent.bias is not None:
-            assert parent.bias.shape[0] == inp_dim, (inp_dim, parent.bias.shape)
-            parent.bias.div_(best_s)
-
-    elif "norm" in parent_op_name:
-        assert hasattr(parent, "weight")
-        if "gemma" in parent_op_name:
-            parent.weight += 1
-            parent.weight.div_(best_s)
-            parent.weight -= 1
-        else:
-            parent.weight.div_(best_s)
-        if hasattr(parent, "bias") and parent.bias is not None:
-            parent.bias.div_(best_s)
-
-    else:
-        raise NotImplementedError(f"Can't rescale previous op {parent}")
-
-    return list(zip(modules_to_scale, scales, zeros))
+    return target, best_s.cpu(), scales, zeros
 
 
 def pack(
     qcfg: QuantConfig,
     model: torch.nn.Module,
-    targets: list[tuple[torch.nn.Linear, torch.Tensor, torch.Tensor]],
+    targets: list[
+        tuple[QuantTarget, torch.Tensor, list[torch.Tensor], list[torch.Tensor]]
+    ],
     pack_dtype=torch.int32,
 ):
-    pack_num_bits = pack_dtype.itemsize * 8
-    num_packed = pack_num_bits // qcfg.num_bits
+    if qcfg.num_bits == 4:
+        # NOTE: not sure where this comes from
+        order_map = [0, 2, 4, 6, 1, 3, 5, 7]
+    else:
+        raise NotImplementedError("Only 4-bit are supported for now.")
 
-    named_targets = []
-    for target, scale, zero in targets:
-        for name, haystack in model.named_modules():
-            if haystack == target:
-                named_targets.append((name, target, scale, zero))
-                break
+    pack_dtype_num_bits = pack_dtype.itemsize * 8
+    assert pack_dtype_num_bits % qcfg.num_bits == 0
+    pack_factor = pack_dtype_num_bits // qcfg.num_bits
+    assert pack_factor == len(order_map)
 
-    # reference code: https://github.com/casper-hansen/AutoAWQ/blob/main/awq/modules/linear/gemm.py#L172
-    for name, target, scale, zero in tqdm.tqdm(
-        named_targets, desc="Packing quantized layers", leave=False
+    for target, best_s, scales, zero in tqdm.tqdm(
+        targets, desc="Scaling parent ops", leave=False
     ):
-        assert isinstance(target, torch.nn.Linear)
+        for module in target.ops:
+            assert isinstance(module, torch.nn.Linear)
+            assert module.in_features == target.ops[0].in_features
 
-        scaled_zeros: torch.Tensor = zero * scale
-        assert scaled_zeros.shape == [
-            target.in_features // qcfg.group_size
-        ], scaled_zeros.shape
+        inp_dim = target.ops[0].in_features
+        parent = target.parent
+        parent_op_name = parent.__class__.__name__.lower()
+        if isinstance(parent, torch.nn.Linear):
+            if parent.weight.shape[0] == inp_dim:
+                parent.weight.div_(best_s.view(inp_dim, 1))
+            elif parent.weight.shape[1] == inp_dim:
+                parent.weight.div_(best_s.view(1, inp_dim))
+            else:
+                raise ValueError(
+                    f"Tried scaling parent op with different inp/out dimensions. inp_dim={inp_dim} parent_shape={parent.weight.shape}"
+                )
 
-        intweight = []
-        for idx in range(target.in_features):
-            intweight.append(
-                torch.round(
-                    (target.weight.data[:, idx] + scaled_zeros[idx // qcfg.group_size])
-                    / scale[idx // qcfg.group_size]
-                ).to(torch.int)[:, None]
+            if parent.bias is not None:
+                assert parent.bias.shape[0] == inp_dim, (inp_dim, parent.bias.shape)
+                parent.bias.div_(best_s)
+
+        elif "norm" in parent_op_name:
+            assert hasattr(parent, "weight")
+            if "gemma" in parent_op_name:
+                parent.weight += 1
+                parent.weight.div_(best_s)
+                parent.weight -= 1
+            else:
+                parent.weight.div_(best_s)
+            if hasattr(parent, "bias") and parent.bias is not None:
+                parent.bias.div_(best_s)
+
+        else:
+            raise NotImplementedError(f"Can't rescale previous op {parent}")
+
+    model_original_num_bytes = 0
+    model_packed_num_bytes = 0
+
+    for target, best_s, scales, zero in targets:
+        for module, scale, zero in zip(target.ops, scales, zero):
+            assert isinstance(module, torch.nn.Linear)
+
+            w = module.weight.data
+            w_s = w * best_s
+            w_q = qcfg.quantize_tensor(w_s, scale, zero).to(pack_dtype)
+            assert w_q.shape == torch.Size([module.out_features, module.in_features])
+
+            qweight = torch.zeros(
+                module.in_features,
+                module.out_features // pack_factor,
+                dtype=pack_dtype,
             )
-        intweight = torch.cat(intweight, dim=1)
-        intweight = intweight.t().contiguous()
-        intweight = intweight.to(pack_dtype)
+            for col in range(module.out_features // pack_factor):
+                for i in range(pack_factor):
+                    qweight_col = w_q[col * pack_factor + order_map[i], :]
+                    qweight[:, col] |= qweight_col << (i * qcfg.num_bits)
 
-        qweight = torch.zeros(
-            (
-                intweight.shape[0],
-                intweight.shape[1] // pack_num_bits * qcfg.num_bits,
-            ),
-            dtype=pack_dtype,
-            device=target.weight.device,
-        )
-        for col in range(intweight.shape[1] // num_packed):
-            if qcfg.num_bits == 4:
-                order_map = [0, 2, 4, 6, 1, 3, 5, 7]
-            else:
-                raise NotImplementedError("Only 4-bit are supported for now.")
-            for i in range(num_packed):
-                qweight_col = intweight[:, col * num_packed + order_map[i]]
-                qweight[:, col] |= qweight_col << (i * qcfg.num_bits)
+            assert zero.shape == torch.Size(
+                [module.out_features, module.in_features // qcfg.group_size]
+            )
+            qzeros = torch.zeros(
+                module.in_features // qcfg.group_size,
+                module.out_features // pack_factor,
+                dtype=pack_dtype,
+            )
+            for col in range(module.out_features // pack_factor):
+                for i in range(pack_factor):
+                    qzero_col = zero[col * pack_factor + order_map[i], :].to(pack_dtype)
+                    qzeros[:, col] |= qzero_col << (i * qcfg.num_bits)
 
-        zeros = zero.to(dtype=pack_dtype)
-        qzeros = torch.zeros(
-            (zeros.shape[0], zeros.shape[1] // pack_num_bits * qcfg.num_bits),
-            dtype=torch.int32,
-            device=zeros.device,
-        )
+            scale = scale.t().contiguous()
+            assert scale.shape == torch.Size(
+                [module.in_features // qcfg.group_size, module.out_features]
+            )
 
-        for col in range(zeros.shape[1] // num_packed):
-            if qcfg.num_bits == 4:
-                order_map = [0, 2, 4, 6, 1, 3, 5, 7]
-            else:
-                raise NotImplementedError("Only 4-bit are supported for now.")
-            for i in range(num_packed):
-                qzero_col = zeros[:, col * num_packed + order_map[i]]
-                qzeros[:, col] |= qzero_col << (i * qcfg.num_bits)
+            module_name = None
+            for name, haystack in model.named_modules():
+                if haystack == module:
+                    module_name = name
+                    break
+            assert module_name is not None
 
-        setattr(
-            model,
-            name,
-            QuantizedLinear(
-                qweight,
-                qzeros,
-                scale.half(),
-                None if target.bias is None else target.bias.half(),
-            ),
-        )
+            original_num_bytes = module.weight.numel() * module.weight.dtype.itemsize
+            if module.bias is not None:
+                original_num_bytes += module.bias.numel() * module.bias.dtype.itemsize
+
+            packed_num_bytes = qweight.numel() * qweight.dtype.itemsize
+            packed_num_bytes += qzeros.numel() * qzeros.dtype.itemsize
+            packed_num_bytes += scale.numel() * scale.dtype.itemsize
+            if module.bias is not None:
+                packed_num_bytes += module.bias.numel() * module.bias.dtype.itemsize
+
+            LOGGER.info(
+                f"Packed {module_name} from {original_num_bytes * 1e-6:.1f} mb to {packed_num_bytes * 1e-6:.1f} mb"
+            )
+            model_original_num_bytes += original_num_bytes
+            model_packed_num_bytes += packed_num_bytes
+
+            owner = model
+            name_parts = module_name.split(".")
+            for attr in name_parts[:-1]:
+                if attr.isnumeric():
+                    owner = owner[int(attr)]
+                else:
+                    owner = getattr(owner, attr)
+            setattr(
+                owner,
+                name_parts[-1],
+                QuantizedLinear(qweight, qzeros, scale, module.bias),
+            )
+
+    LOGGER.info(
+        f"Target layers compressed from {model_original_num_bytes * 1e-9:.1f} gb to {model_packed_num_bytes * 1e-9:.1f} gb"
+    )
 
     model.config.quantization_config = {
         "quant_method": "awq",

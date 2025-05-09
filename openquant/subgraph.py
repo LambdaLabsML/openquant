@@ -19,11 +19,11 @@ class QuantTarget:
     def __init__(
         self,
         *,
-        root: torch.nn.Module,
+        subgraph: torch.nn.Module,
         parent: torch.nn.Module,
         ops: list[torch.nn.Module]
     ):
-        self.subgraph = root
+        self.subgraph = subgraph
         self.parent = parent
         self.ops = ops
 
