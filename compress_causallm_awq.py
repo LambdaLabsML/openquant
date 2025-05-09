@@ -157,7 +157,6 @@ def main():
     awq.pack(quant_config, model, packs)
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
-    model.config.quantization_config = awq.transformers_quant_config(quant_config)
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
 

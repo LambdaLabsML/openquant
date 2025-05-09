@@ -189,17 +189,6 @@ def quantize(
     return list(zip(modules_to_scale, scales, zeros))
 
 
-def transformers_quant_config(qcfg: QuantConfig) -> dict:
-    return {
-        "quant_method": "awq",
-        "zero_point": qcfg.zero_point,
-        "group_size": qcfg.group_size,
-        "bits": qcfg.num_bits,
-        "version": "gemm",
-        "modules_to_not_convert": None,
-    }
-
-
 def pack(
     qcfg: QuantConfig,
     model: torch.nn.Module,
@@ -283,7 +272,14 @@ def pack(
             ),
         )
 
-    raise NotImplementedError()
+    model.config.quantization_config = {
+        "quant_method": "awq",
+        "zero_point": qcfg.zero_point,
+        "group_size": qcfg.group_size,
+        "bits": qcfg.num_bits,
+        "version": "gemm",
+        "modules_to_not_convert": None,
+    }
 
 
 class QuantizedLinear(torch.nn.Module):
