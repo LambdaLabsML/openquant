@@ -5,6 +5,8 @@ import torch
 import transformers
 from transformers import default_data_collator
 
+from .utils import clean_memory
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,7 +41,7 @@ class InputCatcher:
 
     def pre_forward_hook(self, module, args, kwargs):
         assert module in self.modules
-        self.inputs.append([args_to(args, "cpu"), kwargs_to(kwargs, "cpu")])
+        self.inputs.append([to_device(args, "cpu"), to_device(kwargs, "cpu")])
         raise ForwardPassEarlyStop()
 
     def remove_handle_and_get(self):
@@ -56,6 +58,8 @@ def init_subgraph_inputs(
     batch_size: int,
     device: torch.device,
 ) -> list:
+    clean_memory(device)
+
     catcher = InputCatcher([subgraph])
     for i in tqdm.tqdm(
         range(0, len(ds), batch_size),
@@ -65,11 +69,10 @@ def init_subgraph_inputs(
         uncollated_batch = ds[i : i + batch_size]
         collated_batch = default_data_collator(uncollated_batch)
         model_inputs = model.prepare_inputs_for_generation(**collated_batch)
-        model_inputs = {
-            k: v.to(device) if v is not None else v for k, v in model_inputs.items()
-        }
+        x = {k: v.to(device) if v is not None else v for k, v in model_inputs.items()}
+        x["use_cache"] = False
         try:
-            _ = model(**model_inputs)
+            model(**x)
         except ForwardPassEarlyStop:
             pass
     return catcher.remove_handle_and_get()
@@ -77,6 +80,7 @@ def init_subgraph_inputs(
 
 def update_subgraph_inputs(subgraph: torch.nn.Module, subgraph_inputs: list):
     device = next(subgraph.parameters()).device
+    clean_memory(device)
 
     for i in tqdm.tqdm(
         range(len(subgraph_inputs)),
@@ -85,17 +89,12 @@ def update_subgraph_inputs(subgraph: torch.nn.Module, subgraph_inputs: list):
     ):
         try:
             output = subgraph(
-                *args_to(subgraph_inputs[i][0], device),
-                **kwargs_to(subgraph_inputs[i][1], device),
+                *to_device(subgraph_inputs[i][0], device),
+                **to_device(subgraph_inputs[i][1], device),
             )
-            if isinstance(output, tuple):
-                output = tuple(
-                    o.cpu() if isinstance(o, torch.Tensor) else o for o in output
-                )
-            elif isinstance(output, torch.Tensor):
-                output = (output.cpu(),)
-            else:
-                raise NotImplementedError(type(output))
+            output = to_device(output, "cpu")
+            if isinstance(output, torch.Tensor):
+                output = (output,)
             subgraph_inputs[i][0] = output
         except ForwardPassEarlyStop:
             pass
@@ -105,22 +104,27 @@ def get_layer_inputs(
     layers: list[torch.nn.Module], subgraph: torch.nn.Module, subgraph_inputs: list
 ):
     device = next(subgraph.parameters()).device
+    clean_memory(device)
 
     catcher = InputCatcher(layers)
     for a, k in tqdm.tqdm(subgraph_inputs, leave=False, desc="Capturing layer inputs"):
         try:
-            _ = subgraph(*args_to(a, device), **kwargs_to(k, device))
+            _ = subgraph(*to_device(a, device), **to_device(k, device))
         except ForwardPassEarlyStop:
             pass
     return catcher.remove_handle_and_get()
 
 
-def args_to(args: list, device: torch.device) -> list:
-    return [arg.to(device) if isinstance(arg, torch.Tensor) else arg for arg in args]
-
-
-def kwargs_to(kwargs: list, device: torch.device) -> list:
-    return {
-        key: value.to(device) if isinstance(value, torch.Tensor) else value
-        for key, value in kwargs.items()
-    }
+def to_device(obj, device):
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    elif isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    elif isinstance(obj, list):
+        return [to_device(o, device) for o in obj]
+    elif isinstance(obj, tuple):
+        return tuple(to_device(o, device) for o in obj)
+    elif isinstance(obj, dict):
+        return {k: to_device(v, device) for k, v in obj.items()}
+    else:
+        raise NotImplementedError(type(obj))

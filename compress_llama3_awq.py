@@ -113,7 +113,10 @@ def main():
     attn_impl = get_attn_implementation()
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, attn_implementation=attn_impl, torch_dtype="auto"
+        args.model,
+        attn_implementation=attn_impl,
+        torch_dtype="auto",
+        use_cache=False,
     )
 
     plan = make_plan(model)
@@ -144,19 +147,18 @@ def main():
         # quantize each of the targets in this subgraph
         for target in targets:
             LOGGER.info(f"Quantizing {target.names(model)}")
-            clean_memory(device)
+            subgraph.to(device)
 
             # get inputs to target
-            subgraph.to(device)
             target_inputs = get_layer_inputs(target.ops, subgraph, subgraph_inputs)
-
-            clean_memory(device)
 
             # quantize it
             try:
                 packs.extend(awq.quantize(quant_config, target, target_inputs, device))
             except torch.OutOfMemoryError:
-                LOGGER.debug("Sending subgraph back to CPU")
+                LOGGER.error(
+                    "Sending subgraph back to CPU - could reduce batch size further to reduce device transfer"
+                )
                 subgraph.cpu()
                 packs.extend(awq.quantize(quant_config, target, target_inputs, device))
 

@@ -77,6 +77,9 @@ def quantize(
 
     https://arxiv.org/abs/2306.00978
     """
+    clean_memory(device)
+    assert all(isinstance(m, torch.nn.Linear) for m in target.ops)
+
     modules_to_scale: list[torch.nn.Linear] = target.ops
     module_to_inverse_scale: torch.nn.Module = target.parent
 
@@ -112,34 +115,32 @@ def quantize(
     best_loss = float("inf")
     best_s = None
     best_alpha = None
-    pbar = tqdm.tqdm(total=search_grid_size + 1, leave=False, desc="Searching scales")
-    for alpha in torch.linspace(0, 1, steps=search_grid_size + 1):
+    for alpha in tqdm.tqdm(
+        torch.linspace(0, 1, steps=search_grid_size + 1),
+        desc="Searching scales",
+        leave=False,
+        total=search_grid_size + 1,
+    ):
         s = s_x.pow(alpha).clamp(min=1e-8)
         s[torch.isinf(s) | torch.isnan(s)] = 1
 
         w_s = w * s
         w_q = qcfg.quantize_tensor(w_s, *qcfg.compute_qparams(w_s))
 
-        loss_factor = 1 / (total_batch_size * w.shape[0])
         loss = 0
         for x in xs:
             x = x.to(device)
             # NOTE: don't need to use bias because the bias will be unchanged and so will cancel each other out
-            y = F.linear(x, w)
-            y_q = F.linear(x / s, w_q)
-            loss += ((y - y_q).square() * loss_factor).sum()
+            y = F.linear(x, w).float()
+            y_q = F.linear(x / s, w_q).float()
+            loss += (y - y_q).square().sum()
+        loss /= total_batch_size * w.shape[0]
+        LOGGER.debug(f"loss={loss} @ alpha={alpha:.3f}")
 
         if loss < best_loss:
             best_loss = loss
             best_s = s
             best_alpha = alpha
-
-        pbar.set_description(
-            f"Searching scales: best_loss={best_loss} @ alpha={best_alpha:.3f}",
-            refresh=False,
-        )
-        pbar.update()
-    pbar.close()
 
     LOGGER.info(f"best_loss={best_loss} @ alpha={best_alpha:.3f}")
 
@@ -255,7 +256,7 @@ def pack(
                 qweight_col = intweight[:, col * num_packed + order_map[i]]
                 qweight[:, col] |= qweight_col << (i * qcfg.num_bits)
 
-        zeros = zeros.to(dtype=pack_dtype)
+        zeros = zero.to(dtype=pack_dtype)
         qzeros = torch.zeros(
             (zeros.shape[0], zeros.shape[1] // pack_num_bits * qcfg.num_bits),
             dtype=torch.int32,
