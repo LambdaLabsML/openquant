@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import gc
 import logging
 
@@ -22,7 +23,6 @@ def get_attn_implementation():
 
 def clean_memory(device: torch.device = None):
     peak_gb = torch.cuda.max_memory_allocated(device) * 1e-9
-    torch.cuda.reset_peak_memory_stats(device)
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -31,3 +31,17 @@ def clean_memory(device: torch.device = None):
     LOGGER.debug(
         f"{free_gb:.1f}GB available | {resv_gb:.1f}GB used | Peak memory: {peak_gb:.1f}GB"
     )
+
+
+@contextmanager
+def rank0_first():
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            yield
+        torch.distributed.barrier()
+        if rank > 0:
+            yield
+        torch.distributed.barrier()
+    else:
+        yield

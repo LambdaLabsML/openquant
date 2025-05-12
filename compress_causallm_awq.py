@@ -4,6 +4,7 @@ import logging
 
 import tqdm
 import torch
+import torch.distributed as dist
 import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -63,16 +64,23 @@ def main():
     model_name = os.path.basename(args.model)
     quant_name = f"{model_name}-AWQ-Int4"
 
-    logging.basicConfig(level=logging.INFO)
+    if torch.cuda.device_count() > 1:
+        dist.init_process_group(world_size=torch.cuda.device_count())
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        logging.basicConfig(
+            format=f"[rank={rank}] [%(asctime)s] %(levelname)s:%(message)s",
+            level=logging.INFO,
+        )
+    else:
+        rank = 0
+        world_size = 1
+        logging.basicConfig(level=logging.INFO)
 
     LOGGER.info(args)
     LOGGER.info(os.environ)
-
-    target_device = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
-    LOGGER.info(f"Using cuda:{target_device}")
-
-    # NOTE: `0` index means the first **visible** cuda device
-    device = torch.device("cuda:0")
+    LOGGER.info(f"Using cuda:{rank}")
+    device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
     quant_config = awq.QuantConfig(num_bits=4, zero_point=not args.no_zero_point)
@@ -99,31 +107,37 @@ def main():
         )
 
     LOGGER.info(f"Loading dataset {args.dataset}")
-    ds = datasets.load_dataset(
-        args.dataset, args.dataset_name, split=args.dataset_split
-    )
+    with rank0_first():
+        ds = datasets.load_dataset(
+            args.dataset, args.dataset_name, split=args.dataset_split
+        )
     ds = ds.shuffle(seed=0).select(range(args.num_samples))
     ds = ds.map(preprocess)
     ds = ds.map(tokenize, remove_columns=ds.column_names)
     ds = ds.to_list()
 
-    LOGGER.info(f"Loading {args.model}")
     attn_impl = get_attn_implementation()
+    LOGGER.info(f"Loading {args.model}")
+    with rank0_first():
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            attn_implementation=attn_impl,
+            torch_dtype="auto",
+            use_cache=False,
+        )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        attn_implementation=attn_impl,
-        torch_dtype="auto",
-        use_cache=False,
-    )
+    cache_dir = f".cache/{quant_name}"
+    os.makedirs(cache_dir, exist_ok=True)
 
     plan = models.make_plan(model)
     for i, target in enumerate(plan):
-        LOGGER.info(f"{i+1}. {target.names(model)}")
+        target_rank = max(i // (len(plan) // world_size), world_size - 1)
+        LOGGER.info(f"{i+1}. {target.names(model)} (on rank={target_rank})")
 
     last_subgraph = None
-    packs = []
     for target in tqdm.tqdm(plan):
+        target_rank = max(i // (len(plan) // world_size), world_size - 1)
+
         # compute new inputs for this subgraph
         if last_subgraph is None:
             models.head_to_device(model, device)
@@ -136,7 +150,16 @@ def main():
             update_subgraph_inputs(last_subgraph, subgraph_inputs)
             last_subgraph.cpu()
 
-        LOGGER.debug(f"Quantizing {target.names(model)}")
+        last_subgraph = target.subgraph
+
+        if target_rank != rank:
+            continue
+
+        if os.path.exists(f"{cache_dir}/{target.osname(model)}.pt"):
+            LOGGER.info(f"{target.names(model)} already exists in .cache/. Skipping!")
+            continue
+
+        LOGGER.debug(f"Quantizing {target.names(model)} on rank={target_rank}")
         target.subgraph.to(device)
 
         # get inputs to target
@@ -144,22 +167,33 @@ def main():
 
         # quantize it
         try:
-            packs.append(awq.quantize(quant_config, target, target_inputs, device))
+            pack = awq.quantize(quant_config, target, target_inputs, device)
         except torch.OutOfMemoryError:
             LOGGER.error("Sending subgraph back to CPU - reduce batch size to avoid")
             target.subgraph.cpu()
-            packs.append(awq.quantize(quant_config, target, target_inputs, device))
+            pack = awq.quantize(quant_config, target, target_inputs, device)
 
-        last_subgraph = target.subgraph
+        torch.save(pack, f"{cache_dir}/{target.osname(model)}.pt")
 
     last_subgraph.cpu()
 
-    LOGGER.info("Packing model...")
-    awq.pack(quant_config, model, packs)
+    if world_size > 1:
+        dist.barrier()
 
-    LOGGER.info(f"Saving quantized model to {quant_name}")
-    model.save_pretrained(quant_name)
-    tokenizer.save_pretrained(quant_name)
+    if rank == 0:
+        LOGGER.info("Loading all packs")
+        packs = []
+        for target in tqdm.tqdm(plan, desc="Loading packs from cache", leave=False):
+            packs.append(
+                (target, *torch.load(f"{cache_dir}/{target.osname(model)}.pt"))
+            )
+
+        LOGGER.info("Packing model...")
+        awq.pack(quant_config, model, packs)
+
+        LOGGER.info(f"Saving quantized model to {quant_name}")
+        model.save_pretrained(quant_name)
+        tokenizer.save_pretrained(quant_name)
 
 
 if __name__ == "__main__":

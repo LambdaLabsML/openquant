@@ -169,7 +169,7 @@ def quantize(
 
     scales = torch.split(best_scale, [m.out_features for m in target.ops], dim=0)
     zeros = torch.split(best_zero, [m.out_features for m in target.ops], dim=0)
-    return target, best_s.cpu(), scales, zeros
+    return best_s.cpu(), scales, zeros
 
 
 @torch.inference_mode()
@@ -193,7 +193,7 @@ def pack(
     assert pack_factor == len(order_map)
     LOGGER.info(f"Packing {pack_factor} int{qcfg.num_bits} into {pack_dtype}")
 
-    for target, best_s, scales, zero in tqdm.tqdm(
+    for target, best_s, _, _ in tqdm.tqdm(
         targets, desc="Scaling parent ops", leave=False
     ):
         for module in target.ops:

@@ -36,6 +36,9 @@ class QuantTarget:
                     break
         return tmp
 
+    def osname(self, root: torch.nn.Module):
+        return "-".join([name.replace(".", "_") for name in self.names(root)])
+
 
 class InputCatcher:
     def __init__(self, modules: list[torch.nn.Module]):
