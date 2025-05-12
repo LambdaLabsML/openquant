@@ -8,7 +8,6 @@ import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from openquant import *
-from openquant import awq, models
 
 LOGGER = logging.getLogger(__name__)
 
@@ -137,7 +136,7 @@ def main():
             update_subgraph_inputs(last_subgraph, subgraph_inputs)
             last_subgraph.cpu()
 
-        LOGGER.info(f"Quantizing {target.names(model)}")
+        LOGGER.debug(f"Quantizing {target.names(model)}")
         target.subgraph.to(device)
 
         # get inputs to target
