@@ -87,6 +87,7 @@ def quantize(
     inputs,
     device: torch.device,
     search_grid_size: int = 20,
+    enable_early_stopping: bool = True,
 ):
     """
     AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration
@@ -161,7 +162,7 @@ def quantize(
             best_alpha = alpha
             best_scale = scale.cpu()
             best_zero = zero.cpu()
-        else:
+        elif enable_early_stopping:
             break
 
     LOGGER.debug(f"best_loss={best_loss} @ alpha={best_alpha:.3f}")
