@@ -145,11 +145,11 @@ def main():
             subgraph_inputs = init_subgraph_inputs(
                 model, target.subgraph, ds, args.batch_size, device
             )
-            model.cpu()
+            model.to("cpu", non_blocking=True)
         elif last_subgraph != target.subgraph:
             last_subgraph.to(device)
             update_subgraph_inputs(last_subgraph, subgraph_inputs)
-            last_subgraph.cpu()
+            last_subgraph.to("cpu", non_blocking=True)
 
         last_subgraph = target.subgraph
 
@@ -176,7 +176,7 @@ def main():
 
         torch.save(pack, f"{cache_dir}/{target.osname(model)}.pt")
 
-    last_subgraph.cpu()
+    last_subgraph.to("cpu", non_blocking=True)
 
     if world_size > 1:
         LOGGER.info("Waiting for all ranks to finish quantizing")

@@ -175,10 +175,10 @@ def quantize(
 
         if loss < best_loss:
             best_loss = loss
-            best_s = s.cpu()
+            best_s = s.to("cpu", non_blocking=True)
             best_alpha = alpha
-            best_scale = scale.cpu()
-            best_zero = zero.cpu()
+            best_scale = scale.to("cpu", non_blocking=True)
+            best_zero = zero.to("cpu", non_blocking=True)
         elif enable_early_stopping:
             # NOTE: the loss **tends to** decrease until the minimum, and then increase,
             #       so once the loss starts to increase we just stop early
