@@ -214,10 +214,7 @@ def pack(
     LOGGER.info(f"Packing {pack_factor} int{qcfg.num_bits} into {pack_dtype}")
 
     for target, best_s, _, _ in tqdm.tqdm(
-        targets,
-        desc="Scaling parent ops",
-        leave=False,
-        disable=dist.is_initialized(),
+        targets, desc="Scaling parent ops", leave=False
     ):
         for module in target.ops:
             assert isinstance(module, torch.nn.Linear)

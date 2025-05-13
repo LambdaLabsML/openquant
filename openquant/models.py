@@ -377,7 +377,17 @@ class Qwen3:
                             ops=[decoder.mlp.gate],
                         )
                     )
-                    # TODO quantize the experts
+                    expert: Qwen3MoeMLP
+                    for expert in decoder.mlp.experts:
+                        plan[-1].ops.append(expert.gate_proj)
+                        plan[-1].ops.append(expert.up_proj)
+                        plan.append(
+                            QuantTarget(
+                                subgraph=decoder,
+                                parent=expert.up_proj,
+                                ops=[expert.down_proj],
+                            )
+                        )
                 else:
                     raise NotImplementedError(type(decoder.mlp))
 
