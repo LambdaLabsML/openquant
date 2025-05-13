@@ -39,9 +39,9 @@ def rank0_first():
         rank = torch.distributed.get_rank()
         if rank == 0:
             yield
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[rank])
         if rank > 0:
             yield
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[rank])
     else:
         yield

@@ -5,6 +5,7 @@ import logging
 import tqdm
 import torch
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -14,6 +15,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 @torch.inference_mode()
+@record
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -64,8 +66,8 @@ def main():
     model_name = os.path.basename(args.model)
     quant_name = f"{model_name}-AWQ-Int4"
 
-    if torch.cuda.device_count() > 1:
-        dist.init_process_group(world_size=torch.cuda.device_count())
+    if "WORLD_SIZE" in os.environ:
+        dist.init_process_group()
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         logging.basicConfig(
@@ -88,9 +90,10 @@ def main():
         f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    with rank0_first():
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
     def preprocess(example):
         return {
@@ -106,37 +109,35 @@ def main():
             add_special_tokens=False,
         )
 
-    LOGGER.info(f"Loading dataset {args.dataset}")
     with rank0_first():
+        LOGGER.info(f"Loading dataset {args.dataset}")
         ds = datasets.load_dataset(
             args.dataset, args.dataset_name, split=args.dataset_split
         )
-    ds = ds.shuffle(seed=0).select(range(args.num_samples))
-    ds = ds.map(preprocess)
-    ds = ds.map(tokenize, remove_columns=ds.column_names)
-    ds = ds.to_list()
+        ds = ds.shuffle(seed=0).select(range(args.num_samples))
+        ds = ds.map(preprocess)
+        ds = ds.map(tokenize, remove_columns=ds.column_names)
+        ds = ds.to_list()
 
     attn_impl = get_attn_implementation()
-    LOGGER.info(f"Loading {args.model}")
     with rank0_first():
+        LOGGER.info(f"Loading {args.model}")
         model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            attn_implementation=attn_impl,
-            torch_dtype="auto",
-            use_cache=False,
+            args.model, attn_implementation=attn_impl, torch_dtype="auto"
         )
-
-    cache_dir = f".cache/{quant_name}"
-    os.makedirs(cache_dir, exist_ok=True)
 
     plan = models.make_plan(model)
     for i, target in enumerate(plan):
-        target_rank = max(i // (len(plan) // world_size), world_size - 1)
+        target_rank = i % world_size
         LOGGER.info(f"{i+1}. {target.names(model)} (on rank={target_rank})")
 
+    cache_dir = f".cache/{quant_name}"
+    with rank0_first():
+        os.makedirs(cache_dir, exist_ok=True)
+
     last_subgraph = None
-    for target in tqdm.tqdm(plan):
-        target_rank = max(i // (len(plan) // world_size), world_size - 1)
+    for i, target in enumerate(plan):
+        target_rank = i % world_size
 
         # compute new inputs for this subgraph
         if last_subgraph is None:
@@ -156,10 +157,10 @@ def main():
             continue
 
         if os.path.exists(f"{cache_dir}/{target.osname(model)}.pt"):
-            LOGGER.info(f"{target.names(model)} already exists in .cache/. Skipping!")
+            LOGGER.info(f"Skipping {target.names(model)} (already exists in .cache/)")
             continue
 
-        LOGGER.debug(f"Quantizing {target.names(model)} on rank={target_rank}")
+        LOGGER.info(f"Quantizing {target.names(model)} on rank={target_rank}")
         target.subgraph.to(device)
 
         # get inputs to target
@@ -178,7 +179,8 @@ def main():
     last_subgraph.cpu()
 
     if world_size > 1:
-        dist.barrier()
+        LOGGER.info("Waiting for all ranks to finish quantizing")
+        dist.barrier(device_ids=[rank])
 
     if rank == 0:
         LOGGER.info("Loading all packs")
@@ -194,6 +196,11 @@ def main():
         LOGGER.info(f"Saving quantized model to {quant_name}")
         model.save_pretrained(quant_name)
         tokenizer.save_pretrained(quant_name)
+
+    if world_size > 1:
+        LOGGER.info("Waiting for all ranks to finish before quitting.")
+        dist.barrier(device_ids=[rank])
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

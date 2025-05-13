@@ -188,71 +188,71 @@ class Llama4:
                 )
             model = model.language_model
 
-        if isinstance(model, Llama4ForCausalLM):
-            decoder: Llama4TextDecoderLayer
-            for decoder in model.model.layers:
+        assert isinstance(model, Llama4ForCausalLM)
+        decoder: Llama4TextDecoderLayer
+        for decoder in model.model.layers:
+            plan.append(
+                QuantTarget(
+                    subgraph=decoder,
+                    parent=decoder.input_layernorm,
+                    ops=[
+                        decoder.self_attn.q_proj,
+                        decoder.self_attn.k_proj,
+                        decoder.self_attn.v_proj,
+                    ],
+                )
+            )
+            if (
+                decoder.self_attn.o_proj.in_features
+                in decoder.self_attn.v_proj.weight.shape
+            ):
                 plan.append(
                     QuantTarget(
                         subgraph=decoder,
-                        parent=decoder.input_layernorm,
+                        parent=decoder.self_attn.v_proj,
+                        ops=[decoder.self_attn.o_proj],
+                    )
+                )
+            if decoder.is_moe_layer:
+                assert isinstance(decoder.feed_forward, Llama4TextMoe)
+                # TODO quantize experts
+                plan.append(
+                    QuantTarget(
+                        subgraph=decoder,
+                        parent=decoder.post_attention_layernorm,
                         ops=[
-                            decoder.self_attn.q_proj,
-                            decoder.self_attn.k_proj,
-                            decoder.self_attn.v_proj,
+                            decoder.feed_forward.shared_expert.gate_proj,
+                            decoder.feed_forward.shared_expert.up_proj,
+                            decoder.feed_forward.router,
                         ],
                     )
                 )
-                if (
-                    decoder.self_attn.o_proj.in_features
-                    in decoder.self_attn.v_proj.weight.shape
-                ):
-                    plan.append(
-                        QuantTarget(
-                            subgraph=decoder,
-                            parent=decoder.self_attn.v_proj,
-                            ops=[decoder.self_attn.o_proj],
-                        )
+                plan.append(
+                    QuantTarget(
+                        subgraph=decoder,
+                        parent=decoder.feed_forward.shared_expert.up_proj,
+                        ops=[decoder.feed_forward.shared_expert.down_proj],
                     )
-                if decoder.is_moe_layer:
-                    assert isinstance(decoder.feed_forward, Llama4TextMoe)
-                    # TODO quantize experts
-                    plan.append(
-                        QuantTarget(
-                            subgraph=decoder,
-                            parent=decoder.post_attention_layernorm,
-                            ops=[
-                                decoder.feed_forward.shared_expert.gate_proj,
-                                decoder.feed_forward.shared_expert.up_proj,
-                                decoder.feed_forward.router,
-                            ],
-                        )
+                )
+            else:
+                assert isinstance(decoder.feed_forward, Llama4TextMLP)
+                plan.append(
+                    QuantTarget(
+                        subgraph=decoder,
+                        parent=decoder.post_attention_layernorm,
+                        ops=[
+                            decoder.feed_forward.gate_proj,
+                            decoder.feed_forward.up_proj,
+                        ],
                     )
-                    plan.append(
-                        QuantTarget(
-                            subgraph=decoder,
-                            parent=decoder.feed_forward.shared_expert.up_proj,
-                            ops=[decoder.feed_forward.shared_expert.down_proj],
-                        )
+                )
+                plan.append(
+                    QuantTarget(
+                        subgraph=decoder,
+                        parent=decoder.feed_forward.up_proj,
+                        ops=[decoder.feed_forward.down_proj],
                     )
-                else:
-                    assert isinstance(decoder.feed_forward, Llama4TextMLP)
-                    plan.append(
-                        QuantTarget(
-                            subgraph=decoder,
-                            parent=decoder.post_attention_layernorm,
-                            ops=[
-                                decoder.feed_forward.gate_proj,
-                                decoder.feed_forward.up_proj,
-                            ],
-                        )
-                    )
-                    plan.append(
-                        QuantTarget(
-                            subgraph=decoder,
-                            parent=decoder.feed_forward.up_proj,
-                            ops=[decoder.feed_forward.down_proj],
-                        )
-                    )
+                )
 
         return plan
 
@@ -276,6 +276,8 @@ class Qwen3:
             Qwen3MoeMLP,
             Qwen3MoeSparseMoeBlock,
         )
+
+        assert isinstance(model, (Qwen3ForCausalLM, Qwen3MoeForCausalLM))
 
         plan = []
 

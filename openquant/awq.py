@@ -3,6 +3,7 @@ import logging
 import tqdm
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from . import clean_memory
 from .subgraph import QuantTarget
@@ -17,8 +18,13 @@ class QuantConfig:
         zero_point: bool = True,
         group_size: int = 128,
     ):
-        assert group_size > 0
-        assert num_bits > 0
+        # TODO support num_bits = 8 - order_map for packing is [0, 2, 1, 3]
+        if num_bits != 4:
+            raise NotImplementedError(
+                "AWQ num_bits only supports 4 bits, packing cannot be done with other sizes"
+            )
+        if group_size not in [32, 64, 128]:
+            raise NotImplementedError("AWQ group_size must be one of [32, 64, 128]")
 
         self.num_bits = num_bits
         self.group_size = group_size
@@ -102,7 +108,12 @@ def quantize(
     assert all(m.in_features == inp_dim for m in target.ops)
 
     xs: list[torch.Tensor] = []
-    for args, kwargs in tqdm.tqdm(inputs, desc="Reshaping inputs", leave=False):
+    for args, kwargs in tqdm.tqdm(
+        inputs,
+        desc="Reshaping inputs",
+        leave=False,
+        disable=dist.is_initialized(),
+    ):
         assert len(args) == 1, len(args)
         assert isinstance(args[0], torch.Tensor)
         assert args[0].shape[-1] == inp_dim, args[0].shape
@@ -118,7 +129,12 @@ def quantize(
     # NOTE: input magnitude calculation (per input channel i.e. per `inp_dim`)
     s_x: torch.Tensor = 0
     # TODO filter out padded!!!
-    for x in tqdm.tqdm(xs, desc="Computing input mangitude", leave=False):
+    for x in tqdm.tqdm(
+        xs,
+        desc="Computing input mangitude",
+        leave=False,
+        disable=dist.is_initialized(),
+    ):
         # NOTE: x has shape [batch, inp_dim]
         # NOTE: this reshape is the group-wise functionality
         g_x = x.to(device).reshape(x.shape[0], -1, qcfg.group_size)
@@ -138,6 +154,7 @@ def quantize(
         desc="Searching scales",
         leave=False,
         total=search_grid_size + 1,
+        disable=dist.is_initialized(),
     ):
         s = s_x.pow(alpha).clamp(min=1e-8)
         s[torch.isinf(s) | torch.isnan(s)] = 1
@@ -154,22 +171,24 @@ def quantize(
             y_qdq = F.linear(x / s, w_qdq).float()
             loss += (y - y_qdq).square().sum()
         loss /= total_batch_size * total_out_size
-        LOGGER.debug(f"loss={loss} @ alpha={alpha:.3f}")
+        LOGGER.info(f"loss={loss} @ alpha={alpha:.3f}")
 
         if loss < best_loss:
             best_loss = loss
-            best_s = s
+            best_s = s.cpu()
             best_alpha = alpha
             best_scale = scale.cpu()
             best_zero = zero.cpu()
         elif enable_early_stopping:
+            # NOTE: the loss **tends to** decrease until the minimum, and then increase,
+            #       so once the loss starts to increase we just stop early
             break
 
-    LOGGER.debug(f"best_loss={best_loss} @ alpha={best_alpha:.3f}")
+    LOGGER.info(f"best_loss={best_loss} @ alpha={best_alpha:.3f}")
 
     scales = torch.split(best_scale, [m.out_features for m in target.ops], dim=0)
     zeros = torch.split(best_zero, [m.out_features for m in target.ops], dim=0)
-    return best_s.cpu(), scales, zeros
+    return best_s, scales, zeros
 
 
 @torch.inference_mode()
@@ -182,7 +201,8 @@ def pack(
     pack_dtype=torch.int32,
 ):
     if qcfg.num_bits == 4:
-        # NOTE: not sure where this comes from
+        # NOTE: not sure why, but you can see this used in VLLM marlin kernels here
+        # https://github.com/vllm-project/vllm/blob/v0.8.5.post1/vllm/model_executor/layers/quantization/utils/marlin_utils.py#L257
         order_map = [0, 2, 4, 6, 1, 3, 5, 7]
     else:
         raise NotImplementedError("Only 4-bit are supported for now.")
@@ -194,7 +214,10 @@ def pack(
     LOGGER.info(f"Packing {pack_factor} int{qcfg.num_bits} into {pack_dtype}")
 
     for target, best_s, _, _ in tqdm.tqdm(
-        targets, desc="Scaling parent ops", leave=False
+        targets,
+        desc="Scaling parent ops",
+        leave=False,
+        disable=dist.is_initialized(),
     ):
         for module in target.ops:
             assert isinstance(module, torch.nn.Linear)
@@ -271,6 +294,8 @@ def pack(
             )
             assert scale.dtype in [torch.float16, torch.bfloat16]
 
+            # NOTE: for vllm compatibility with tensor shapes/dtypes check here:
+            # https://github.com/vllm-project/vllm/blob/v0.8.5.post1/vllm/model_executor/layers/quantization/awq.py#L98
             packed = PackedLayer(qweight, qzeros, scale, module.bias)
 
             module_name = None
@@ -280,6 +305,8 @@ def pack(
                     break
             assert module_name is not None
 
+            # NOTE: we have to get the owner this way because torch stores list index as `.<index>.<next part>`,
+            # and that is not compatible with getattr & lists
             owner = model
             name_parts = module_name.split(".")
             for attr in name_parts[:-1]:
@@ -307,6 +334,8 @@ def pack(
         f"Model compressed from {model_original_num_bytes * 1e-9:.1f} gb to {model_packed_num_bytes * 1e-9:.1f} gb"
     )
 
+    # NOTE: vllm compatibility here
+    # https://github.com/vllm-project/vllm/blob/v0.8.5.post1/vllm/model_executor/layers/quantization/awq.py#L67
     model.config.quantization_config = {
         "quant_method": "awq",
         "zero_point": qcfg.zero_point,
@@ -323,7 +352,7 @@ class PackedLayer(torch.nn.Module):
         qweight: torch.Tensor,
         qzeros: torch.Tensor,
         scales: torch.Tensor,
-        bias: torch.Tensor = None,
+        bias: torch.Tensor,
     ):
         super().__init__()
         self.qweight = torch.nn.Parameter(qweight, requires_grad=False)

@@ -2,6 +2,7 @@ import logging
 
 import tqdm
 import torch
+import torch.distributed as dist
 import transformers
 from transformers import default_data_collator
 
@@ -75,6 +76,7 @@ def init_subgraph_inputs(
         range(0, len(ds), batch_size),
         leave=False,
         desc="Initializing subgraph inputs",
+        disable=dist.is_initialized(),
     ):
         uncollated_batch = ds[i : i + batch_size]
         collated_batch = default_data_collator(uncollated_batch)
@@ -96,6 +98,7 @@ def update_subgraph_inputs(subgraph: torch.nn.Module, subgraph_inputs: list):
         range(len(subgraph_inputs)),
         leave=False,
         desc="Updating subgraph inputs",
+        disable=dist.is_initialized(),
     ):
         try:
             output = subgraph(
@@ -117,7 +120,12 @@ def get_layer_inputs(
     clean_memory(device)
 
     catcher = InputCatcher(layers)
-    for a, k in tqdm.tqdm(subgraph_inputs, leave=False, desc="Capturing layer inputs"):
+    for a, k in tqdm.tqdm(
+        subgraph_inputs,
+        leave=False,
+        desc="Capturing layer inputs",
+        disable=dist.is_initialized(),
+    ):
         try:
             _ = subgraph(*to_device(a, device), **to_device(k, device))
         except ForwardPassEarlyStop:
