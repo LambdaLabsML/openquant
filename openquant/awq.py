@@ -171,7 +171,7 @@ def quantize(
             y_qdq = F.linear(x / s, w_qdq).float()
             loss += (y - y_qdq).square().sum()
         loss /= total_batch_size * total_out_size
-        LOGGER.info(f"loss={loss} @ alpha={alpha:.3f}")
+        LOGGER.debug(f"loss={loss} @ alpha={alpha:.3f}")
 
         if loss < best_loss:
             best_loss = loss

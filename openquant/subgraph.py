@@ -52,7 +52,12 @@ class InputCatcher:
 
     def pre_forward_hook(self, module, args, kwargs):
         assert module in self.modules
-        self.inputs.append([to_device(args, "cpu"), to_device(kwargs, "cpu")])
+        self.inputs.append(
+            [
+                to_device(args, "cpu", non_blocking=True),
+                to_device(kwargs, "cpu", non_blocking=True),
+            ]
+        )
         raise ForwardPassEarlyStop()
 
     def remove_handle_and_get(self):
@@ -105,7 +110,7 @@ def update_subgraph_inputs(subgraph: torch.nn.Module, subgraph_inputs: list):
                 *to_device(subgraph_inputs[i][0], device),
                 **to_device(subgraph_inputs[i][1], device),
             )
-            output = to_device(output, "cpu")
+            output = to_device(output, "cpu", non_blocking=True)
             if isinstance(output, torch.Tensor):
                 output = (output,)
             subgraph_inputs[i][0] = output
@@ -133,16 +138,16 @@ def get_layer_inputs(
     return catcher.remove_handle_and_get()
 
 
-def to_device(obj, device):
+def to_device(obj, device, non_blocking=False):
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
     elif isinstance(obj, torch.Tensor):
-        return obj.to(device)
+        return obj.to(device, non_blocking=non_blocking)
     elif isinstance(obj, list):
-        return [to_device(o, device) for o in obj]
+        return [to_device(o, device, non_blocking) for o in obj]
     elif isinstance(obj, tuple):
-        return tuple(to_device(o, device) for o in obj)
+        return tuple(to_device(o, device, non_blocking) for o in obj)
     elif isinstance(obj, dict):
-        return {k: to_device(v, device) for k, v in obj.items()}
+        return {k: to_device(v, device, non_blocking) for k, v in obj.items()}
     else:
         raise NotImplementedError(type(obj))

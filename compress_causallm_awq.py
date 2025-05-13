@@ -166,7 +166,7 @@ def main():
             LOGGER.info(f"Skipping {target.names(model)} (already exists in .cache/)")
             continue
 
-        LOGGER.info(f"Quantizing {target.names(model)} on rank={target_rank}")
+        LOGGER.info(f"{100 * (i / len(plan)):.0f}%: Quantizing {target.names(model)}")
         target.subgraph.to(device)
 
         # get inputs to target
