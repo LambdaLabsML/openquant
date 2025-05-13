@@ -132,10 +132,9 @@ def main():
             args.model, attn_implementation=attn_impl, torch_dtype="auto"
         )
 
-    plan = models.make_plan(model)
-    for i, target in enumerate(plan):
-        target_rank = i % world_size
-        LOGGER.info(f"{i+1}. {target.names(model)} (on rank={target_rank})")
+    # NOTE: vllm doesn't have support for AWQ MoE layers
+    plan = models.make_plan(model, include_experts=False)
+    LOGGER.info(f"{len(plan)} quantization targets")
 
     cache_dir = f".cache/{quant_name}"
     with rank0_first():

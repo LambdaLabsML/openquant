@@ -8,8 +8,8 @@ def head_to_device(model, device):
     REGISTRY[type(model)].head(model, device)
 
 
-def make_plan(model) -> list[QuantTarget]:
-    return REGISTRY[type(model)].plan(model)
+def make_plan(model, *, include_experts: bool = False) -> list[QuantTarget]:
+    return REGISTRY[type(model)].plan(model, include_experts=include_experts)
 
 
 class Llama:
@@ -19,7 +19,7 @@ class Llama:
         model.model.rotary_emb.to(device)
 
     @staticmethod
-    def plan(model) -> list[QuantTarget]:
+    def plan(model, include_experts: bool) -> list[QuantTarget]:
         from transformers.models.llama.modeling_llama import (
             LlamaDecoderLayer,
             LlamaForCausalLM,
@@ -80,7 +80,7 @@ class Gemma3:
         model.model.rotary_emb_local.to(device)
 
     @staticmethod
-    def plan(model) -> list[QuantTarget]:
+    def plan(model, include_experts: bool) -> list[QuantTarget]:
         from transformers.models.gemma3.modeling_gemma3 import (
             Gemma3ForCausalLM,
             Gemma3DecoderLayer,
@@ -141,7 +141,7 @@ class Llama4:
         model.model.rotary_emb.to(device)
 
     @staticmethod
-    def plan(model) -> list[QuantTarget]:
+    def plan(model, include_experts: bool) -> list[QuantTarget]:
         from transformers.models.llama4.modeling_llama4 import (
             Llama4ForConditionalGeneration,
             Llama4TextDecoderLayer,
@@ -215,7 +215,6 @@ class Llama4:
                 )
             if decoder.is_moe_layer:
                 assert isinstance(decoder.feed_forward, Llama4TextMoe)
-                # TODO quantize experts
                 plan.append(
                     QuantTarget(
                         subgraph=decoder,
@@ -234,6 +233,8 @@ class Llama4:
                         ops=[decoder.feed_forward.shared_expert.down_proj],
                     )
                 )
+                if include_experts:
+                    raise NotImplementedError("TODO Llama4 experts")
             else:
                 assert isinstance(decoder.feed_forward, Llama4TextMLP)
                 plan.append(
@@ -264,7 +265,7 @@ class Qwen3:
         model.model.rotary_emb.to(device)
 
     @staticmethod
-    def plan(model) -> list[QuantTarget]:
+    def plan(model, include_experts: bool) -> list[QuantTarget]:
         from transformers.models.qwen3.modeling_qwen3 import (
             Qwen3ForCausalLM,
             Qwen3DecoderLayer,
@@ -377,17 +378,23 @@ class Qwen3:
                             ops=[decoder.mlp.gate],
                         )
                     )
-                    expert: Qwen3MoeMLP
-                    for expert in decoder.mlp.experts:
-                        plan[-1].ops.append(expert.gate_proj)
-                        plan[-1].ops.append(expert.up_proj)
-                        plan.append(
-                            QuantTarget(
-                                subgraph=decoder,
-                                parent=expert.up_proj,
-                                ops=[expert.down_proj],
+                    if include_experts:
+                        expert: Qwen3MoeMLP
+                        for expert in decoder.mlp.experts:
+                            plan.append(
+                                QuantTarget(
+                                    subgraph=decoder,
+                                    parent=decoder.post_attention_layernorm,
+                                    ops=[expert.gate_proj, expert.up_proj],
+                                )
                             )
-                        )
+                            plan.append(
+                                QuantTarget(
+                                    subgraph=decoder,
+                                    parent=expert.up_proj,
+                                    ops=[expert.down_proj],
+                                )
+                            )
                 else:
                     raise NotImplementedError(type(decoder.mlp))
 
