@@ -15,8 +15,8 @@ def make_plan(model, *, include_experts: bool = False) -> list[QuantTarget]:
 class Llama:
     @staticmethod
     def head(model, device):
-        model.model.embed_tokens.to(device)
-        model.model.rotary_emb.to(device)
+        model.model.embed_tokens.to(device=device)
+        model.model.rotary_emb.to(device=device)
 
     @staticmethod
     def plan(model, include_experts: bool) -> list[QuantTarget]:
@@ -75,9 +75,9 @@ class Llama:
 class Gemma3:
     @staticmethod
     def head(model, device):
-        model.model.embed_tokens.to(device)
-        model.model.rotary_emb.to(device)
-        model.model.rotary_emb_local.to(device)
+        model.model.embed_tokens.to(device=device)
+        model.model.rotary_emb.to(device=device)
+        model.model.rotary_emb_local.to(device=device)
 
     @staticmethod
     def plan(model, include_experts: bool) -> list[QuantTarget]:
@@ -137,8 +137,8 @@ class Gemma3:
 class Llama4:
     @staticmethod
     def head(model, device):
-        model.model.embed_tokens.to(device)
-        model.model.rotary_emb.to(device)
+        model.model.embed_tokens.to(device=device)
+        model.model.rotary_emb.to(device=device)
 
     @staticmethod
     def plan(model, include_experts: bool) -> list[QuantTarget]:
@@ -261,8 +261,8 @@ class Llama4:
 class Qwen3:
     @staticmethod
     def head(model, device):
-        model.model.embed_tokens.to(device)
-        model.model.rotary_emb.to(device)
+        model.model.embed_tokens.to(device=device)
+        model.model.rotary_emb.to(device=device)
 
     @staticmethod
     def plan(model, include_experts: bool) -> list[QuantTarget]:

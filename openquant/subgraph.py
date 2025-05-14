@@ -27,18 +27,17 @@ class QuantTarget:
         self.subgraph = subgraph
         self.parent = parent
         self.ops = ops
+        self.names = None
+        self.osname = None
 
-    def names(self, root: torch.nn.Module):
-        tmp = [""] * len(self.ops)
+    def set_names(self, root: torch.nn.Module):
+        self.names = [""] * len(self.ops)
         for name, haystack in root.named_modules():
             for i in range(len(self.ops)):
                 if haystack == self.ops[i]:
-                    tmp[i] = name
+                    self.names[i] = name
                     break
-        return tmp
-
-    def osname(self, root: torch.nn.Module):
-        return "-".join([name.replace(".", "_") for name in self.names(root)])
+        self.osname = "-".join([name.replace(".", "_") for name in self.names])
 
 
 class InputCatcher:
@@ -52,12 +51,7 @@ class InputCatcher:
 
     def pre_forward_hook(self, module, args, kwargs):
         assert module in self.modules
-        self.inputs.append(
-            [
-                to_device(args, "cpu", non_blocking=True),
-                to_device(kwargs, "cpu", non_blocking=True),
-            ]
-        )
+        self.inputs.append([to_device(args, "cpu"), to_device(kwargs, "cpu")])
         raise ForwardPassEarlyStop()
 
     def remove_handle_and_get(self):
@@ -105,17 +99,12 @@ def update_subgraph_inputs(subgraph: torch.nn.Module, subgraph_inputs: list):
         desc="Updating subgraph inputs",
         disable=dist.is_initialized(),
     ):
-        try:
-            output = subgraph(
-                *to_device(subgraph_inputs[i][0], device),
-                **to_device(subgraph_inputs[i][1], device),
-            )
-            output = to_device(output, "cpu", non_blocking=True)
-            if isinstance(output, torch.Tensor):
-                output = (output,)
-            subgraph_inputs[i][0] = output
-        except ForwardPassEarlyStop:
-            pass
+        a, k = subgraph_inputs[i]
+        output = subgraph(*to_device(a, device), **to_device(k, device))
+        output = to_device(output, "cpu")
+        if isinstance(output, torch.Tensor):
+            output = (output,)
+        subgraph_inputs[i][0] = output
 
 
 def get_layer_inputs(

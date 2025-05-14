@@ -1,6 +1,9 @@
 from contextlib import contextmanager
 import gc
 import logging
+import psutil
+import os
+
 
 import torch
 
@@ -22,14 +25,16 @@ def get_attn_implementation():
 
 
 def clean_memory(device: torch.device = None):
-    peak_gb = torch.cuda.max_memory_allocated(device) * 1e-9
-
     gc.collect()
     torch.cuda.empty_cache()
-    free_gb = torch.cuda.mem_get_info(device)[0] * 1e-9
+
+    peak_gb = torch.cuda.max_memory_allocated(device) * 1e-9
     resv_gb = torch.cuda.memory_reserved(device) * 1e-9
+
+    process = psutil.Process(os.getpid())
+    cpu_mem_usage_gb = process.memory_info().rss * 1e-9
     LOGGER.debug(
-        f"{free_gb:.1f}GB available | {resv_gb:.1f}GB used | Peak memory: {peak_gb:.1f}GB"
+        f"CPU {cpu_mem_usage_gb:.1f} GB | GPU {resv_gb:.1f} GB ({peak_gb:.1f} peak GB)"
     )
 
 

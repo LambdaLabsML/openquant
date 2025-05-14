@@ -91,6 +91,14 @@ def main():
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
+    # Turns out the most reliable way to deallocate a module/tensor is to send it to the meta device
+    # Even if you send the module to CPU and `del module` there's not really a great way to
+    # force that to happen because of reference counting (it's extremely hard to get right)
+    # Additionally, transformers by default will mmap the model memory when loaded, so the first
+    # time you use the module it will be copied into RAM. If you **don't** deallocate it properly
+    # you will basically end up with the entire model loaded into ram at the end.
+    null_device = torch.device("meta")
+
     quant_config = awq.QuantConfig(num_bits=4, zero_point=not args.no_zero_point)
     LOGGER.info(
         f"Using {quant_config}. Value range is: [{quant_config.min_int}, {quant_config.max_int}]"
@@ -132,8 +140,10 @@ def main():
             args.model, attn_implementation=attn_impl, torch_dtype="auto"
         )
 
-    # NOTE: vllm doesn't have support for AWQ MoE layers
+    # NOTE: vllm doesn't have support for AWQ MoE layers, so we don't include experts
     plan = models.make_plan(model, include_experts=False)
+    for target in plan:
+        target.set_names(model)
     LOGGER.info(f"{len(plan)} quantization targets")
 
     cache_dir = f".cache/{quant_name}"
@@ -150,50 +160,52 @@ def main():
             subgraph_inputs = init_subgraph_inputs(
                 model, target.subgraph, ds, args.batch_size, device
             )
-            model.to("cpu", non_blocking=True)
+            models.head_to_device(model, null_device)
         elif last_subgraph != target.subgraph:
             last_subgraph.to(device)
             update_subgraph_inputs(last_subgraph, subgraph_inputs)
-            last_subgraph.to("cpu", non_blocking=True)
+            last_subgraph.to(null_device)
 
         last_subgraph = target.subgraph
 
         if target_rank != rank:
             continue
 
-        if os.path.exists(f"{cache_dir}/{target.osname(model)}.pt"):
-            LOGGER.info(f"Skipping {target.names(model)} (already exists in .cache/)")
+        if os.path.exists(f"{cache_dir}/{target.osname}.pt"):
+            LOGGER.info(f"Skipping {target.names} (already exists in .cache/)")
             continue
 
-        LOGGER.info(f"{100 * (i / len(plan)):.0f}%: Quantizing {target.names(model)}")
+        LOGGER.info(f"{100 * (i / len(plan)):.0f}%: Quantizing {target.names}")
         target.subgraph.to(device)
-
-        # get inputs to target
-        target_inputs = get_layer_inputs(target.ops, target.subgraph, subgraph_inputs)
+        xs = get_layer_inputs(target.ops, target.subgraph, subgraph_inputs)
 
         # quantize it
         try:
-            pack = awq.quantize(quant_config, target, target_inputs, device)
+            pack = awq.quantize(quant_config, target, xs, device)
         except torch.OutOfMemoryError:
             LOGGER.error("Sending subgraph back to CPU - reduce batch size to avoid")
             target.subgraph.cpu()
-            pack = awq.quantize(quant_config, target, target_inputs, device)
+            pack = awq.quantize(quant_config, target, xs, device)
 
-        torch.save(pack, f"{cache_dir}/{target.osname(model)}.pt")
+        torch.save(pack, f"{cache_dir}/{target.osname}.pt")
 
-    last_subgraph.to("cpu", non_blocking=True)
+    last_subgraph.to(null_device)
 
     if world_size > 1:
         LOGGER.info("Waiting for all ranks to finish quantizing")
         dist.barrier(device_ids=[rank])
 
     if rank == 0:
+        # NOTE: since we deleted model & all the targets earlier we need to reload them
+        LOGGER.info("Reloading model")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, attn_implementation=attn_impl, torch_dtype="auto"
+        )
+
         LOGGER.info("Loading all packs")
         packs = []
         for target in tqdm.tqdm(plan, desc="Loading packs from cache", leave=False):
-            packs.append(
-                (target, *torch.load(f"{cache_dir}/{target.osname(model)}.pt"))
-            )
+            packs.append((target, *torch.load(f"{cache_dir}/{target.osname}.pt")))
 
         LOGGER.info("Packing model...")
         awq.pack(quant_config, model, packs)
