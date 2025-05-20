@@ -81,13 +81,17 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
         p.numel() * p.dtype.itemsize for p in model.parameters()
     )
 
+    packed_linear = PackedLinear
+    if qcfg.weight_block_size is not None:
+        packed_linear = PackedBlockLinear
+
     for target in targets:
         if all(isinstance(m, torch.nn.Linear) for m in target.ops):
             for module in target.ops:
                 w = module.weight
                 scale = qcfg.compute_qparams(w)
                 q = qcfg.quantize_tensor(w, scale).to(qcfg.dtype)
-                packed = PackedLinearLayer(q, scale)
+                packed = packed_linear(q, scale)
                 set_submodule(model, module, packed)
         elif isinstance(target.ops[0], Qwen3MoeSparseMoeBlock) or isinstance(
             target.ops[0], Llama4TextExperts
@@ -142,10 +146,10 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
                 down_q = qcfg.quantize_tensor(down, down_scale).to(qcfg.dtype)
 
                 packed_experts.append(
-                    PackedMlpLayer(
-                        PackedLinearLayer(down_q, down_scale),
-                        PackedLinearLayer(gate_q, gate_scale),
-                        PackedLinearLayer(up_q, up_scale),
+                    PackedMlp(
+                        packed_linear(down_q, down_scale),
+                        packed_linear(gate_q, gate_scale),
+                        packed_linear(up_q, up_scale),
                     )
                 )
 
@@ -172,7 +176,7 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
     )
 
 
-class PackedLinearLayer(torch.nn.Module):
+class PackedLinear(torch.nn.Module):
     def __init__(
         self,
         weight: torch.Tensor,
@@ -186,23 +190,22 @@ class PackedLinearLayer(torch.nn.Module):
         raise NotImplementedError("This class is only used for serialization")
 
 
-# class PackedLinearInvLayer(torch.nn.Module):
-#     def __init__(
-#         self,
-#         weight: torch.Tensor,
-#         weight_scale_inv: torch.Tensor,
-#     ):
-#         super().__init__()
-#         self.weight = torch.nn.Parameter(weight, requires_grad=False)
-#         self.weight_scale_inv = torch.nn.Parameter(
-#             weight_scale_inv, requires_grad=False
-#         )
+class PackedBlockLinear(torch.nn.Module):
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        # TODO should this be 1 / weight_scale?
+        self.weight_scale_inv = torch.nn.Parameter(weight_scale, requires_grad=False)
 
-#     def forward(self, *args, **kwargs):
-#         raise NotImplementedError("This class is only used for serialization")
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError("This class is only used for serialization")
 
 
-class PackedMlpLayer(torch.nn.Module):
+class PackedMlp(torch.nn.Module):
     def __init__(
         self,
         down_proj: torch.nn.Module,
