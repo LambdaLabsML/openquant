@@ -377,13 +377,14 @@ class Qwen3:
                         )
                     )
                 elif isinstance(decoder.mlp, Qwen3MoeSparseMoeBlock):
-                    plan.append(
-                        QuantTarget(
-                            subgraph=decoder,
-                            parent=decoder.post_attention_layernorm,
-                            ops=[decoder.mlp.gate],
-                        )
-                    )
+                    # NOTE: vllm does NOT support quantized gate here
+                    # plan.append(
+                    #     QuantTarget(
+                    #         subgraph=decoder,
+                    #         parent=decoder.post_attention_layernorm,
+                    #         ops=[decoder.mlp.gate],
+                    #     )
+                    # )
                     if include_experts:
                         plan.append(
                             QuantTarget(

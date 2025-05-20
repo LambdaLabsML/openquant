@@ -76,12 +76,7 @@ class QuantConfig:
 
 
 @torch.inference_mode()
-def pack(
-    qcfg: QuantConfig,
-    model: torch.nn.Module,
-    targets: list[QuantTarget],
-    device: torch.device,
-):
+def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
     model_original_num_bytes = sum(
         p.numel() * p.dtype.itemsize for p in model.parameters()
     )
@@ -89,10 +84,10 @@ def pack(
     for target in targets:
         if all(isinstance(m, torch.nn.Linear) for m in target.ops):
             for module in target.ops:
-                w = module.weight.to(device)
+                w = module.weight
                 scale = qcfg.compute_qparams(w)
                 q = qcfg.quantize_tensor(w, scale).to(qcfg.dtype)
-                packed = PackedLinearLayer(q.cpu(), scale.cpu())
+                packed = PackedLinearLayer(q, scale)
                 set_submodule(model, module, packed)
         elif isinstance(target.ops[0], Qwen3MoeSparseMoeBlock) or isinstance(
             target.ops[0], Llama4TextExperts
@@ -102,21 +97,32 @@ def pack(
                 num_experts = len(experts)
                 intermediate_size = experts[0].intermediate_size
                 hidden_size = experts[0].hidden_size
-                w13 = torch.stack(
-                    [
-                        torch.cat((e.gate_proj.weight, e.up_proj.weight), dim=0)
-                        for e in experts
-                    ]
-                )
-                w2 = torch.stack([e.down_proj.weight for e in experts])
+                gates = [e.gate_proj.weight for e in experts]
+                ups = [e.up_proj.weight for e in experts]
+                downs = [e.down_proj.weight for e in experts]
             elif isinstance(target.ops[0], Llama4TextExperts):
                 experts: Llama4TextExperts = target.ops[0]
                 num_experts = experts.num_experts
                 intermediate_size = experts.intermediate_size
                 hidden_size = experts.hidden_size
-                w13 = experts.gate_up_proj.permute(0, 2, 1).contiguous()
-                w2 = experts.down_proj.permute(0, 2, 1).contiguous()
+                gate, up = (
+                    experts.gate_up_proj.permute(0, 2, 1)
+                    .reshape(num_experts, 2, intermediate_size, hidden_size)
+                    .unbind(dim=1)
+                )
+                gates = gate.unbind()
+                ups = up.unbind()
+                downs = experts.down_proj.permute(0, 2, 1).unbind()
 
+            assert all(
+                g.shape == torch.Size([intermediate_size, hidden_size]) for g in gates
+            )
+            assert all(
+                u.shape == torch.Size([intermediate_size, hidden_size]) for u in ups
+            )
+            assert all(
+                d.shape == torch.Size([hidden_size, intermediate_size]) for d in downs
+            )
             if qcfg.weight_block_size is not None:
                 n, k = qcfg.weight_block_size
                 assert hidden_size % n == 0 and hidden_size % k == 0
@@ -124,43 +130,26 @@ def pack(
             else:
                 n, k = 1, 1
 
-            w13 = w13.to(device)
-            assert w13.shape == torch.Size(
-                [num_experts, 2 * intermediate_size, hidden_size]
-            )
-            w13 = w13.reshape(num_experts, 2, intermediate_size, hidden_size)
-            q13_scale = qcfg.compute_qparams(w13)
-            if qcfg.weight_block_size is None:
-                assert q13_scale.shape == torch.Size([num_experts, 2]), q13_scale.shape
-            else:
-                assert q13_scale.shape == torch.Size(
-                    [num_experts, 2, intermediate_size // n, hidden_size // k]
-                ), (
-                    q13_scale.shape,
-                    [num_experts, 2, intermediate_size // n, hidden_size // k],
+            packed_experts = []
+            for gate, up, down in zip(gates, ups, downs):
+                gate_scale = qcfg.compute_qparams(gate)
+                gate_q = qcfg.quantize_tensor(gate, gate_scale).to(qcfg.dtype)
+
+                up_scale = qcfg.compute_qparams(up)
+                up_q = qcfg.quantize_tensor(up, up_scale).to(qcfg.dtype)
+
+                down_scale = qcfg.compute_qparams(down)
+                down_q = qcfg.quantize_tensor(down, down_scale).to(qcfg.dtype)
+
+                packed_experts.append(
+                    PackedMlpLayer(
+                        PackedLinearLayer(down_q, down_scale),
+                        PackedLinearLayer(gate_q, gate_scale),
+                        PackedLinearLayer(up_q, up_scale),
+                    )
                 )
 
-            q13 = qcfg.quantize_tensor(w13, q13_scale).to(qcfg.dtype)
-            assert q13.shape == w13.shape, (q13.shape, w13.shape)
-            q13 = q13.reshape(num_experts, 2 * intermediate_size, hidden_size)
-
-            w2 = w2.to(device)
-            assert w2.shape == torch.Size([num_experts, hidden_size, intermediate_size])
-            q2_scale = qcfg.compute_qparams(w2)
-            if qcfg.weight_block_size is None:
-                assert q2_scale.shape == torch.Size([num_experts])
-            else:
-                assert q2_scale.shape == torch.Size(
-                    [num_experts, hidden_size // n, intermediate_size // k]
-                )
-
-            q2 = qcfg.quantize_tensor(w2, q2_scale).to(qcfg.dtype)
-            assert q2.shape == w2.shape
-
-            packed = PackedMoELayer(
-                q13.cpu(), q2.cpu(), q13_scale.cpu(), q2_scale.cpu()
-            )
-            set_submodule(model, experts, packed)
+            set_submodule(model, experts, torch.nn.ModuleList(packed_experts))
 
         else:
             raise NotImplementedError(target.ops)
@@ -188,46 +177,42 @@ class PackedLinearLayer(torch.nn.Module):
         self,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
-        input_scale: torch.Tensor = None,
     ):
         super().__init__()
         self.weight = torch.nn.Parameter(weight, requires_grad=False)
         self.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
-        self.input_scale = None
-        if input_scale is not None:
-            self.input_scale = torch.nn.Parameter(input_scale, requires_grad=False)
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError("This class is only used for serialization")
 
 
-class PackedMoELayer(torch.nn.Module):
+# class PackedLinearInvLayer(torch.nn.Module):
+#     def __init__(
+#         self,
+#         weight: torch.Tensor,
+#         weight_scale_inv: torch.Tensor,
+#     ):
+#         super().__init__()
+#         self.weight = torch.nn.Parameter(weight, requires_grad=False)
+#         self.weight_scale_inv = torch.nn.Parameter(
+#             weight_scale_inv, requires_grad=False
+#         )
+
+#     def forward(self, *args, **kwargs):
+#         raise NotImplementedError("This class is only used for serialization")
+
+
+class PackedMlpLayer(torch.nn.Module):
     def __init__(
         self,
-        w13_weight: torch.Tensor,
-        w2_weight: torch.Tensor,
-        w13_weight_scale: torch.Tensor,
-        w2_weight_scale: torch.Tensor,
-        w13_input_scale: torch.Tensor = None,
-        w2_input_scale: torch.Tensor = None,
+        down_proj: torch.nn.Module,
+        gate_proj: torch.nn.Module,
+        up_proj: torch.nn.Module,
     ):
         super().__init__()
-        self.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-        self.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-        self.w13_weight_scale = torch.nn.Parameter(
-            w13_weight_scale, requires_grad=False
-        )
-        self.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
-        self.w13_input_scale = None
-        if w13_input_scale is not None:
-            self.w13_input_scale = torch.nn.Parameter(
-                w13_input_scale, requires_grad=False
-            )
-        self.w2_input_scale = None
-        if w2_input_scale is not None:
-            self.w2_input_scale = torch.nn.Parameter(
-                w2_input_scale, requires_grad=False
-            )
+        self.down_proj = down_proj
+        self.gate_proj = gate_proj
+        self.up_proj = up_proj
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError("This class is only used for serialization")

@@ -32,11 +32,6 @@ def main():
     logging.basicConfig(level=logging.INFO)
 
     LOGGER.info(args)
-    device = torch.device("cpu")
-    if torch.cuda.device_count() > 0:
-        device = torch.device(f"cuda:0")
-        torch.cuda.set_device(device)
-    LOGGER.info(f"Using {device}")
 
     weight_block_size = None
     if args.weight_block_size is not None:
@@ -55,12 +50,12 @@ def main():
     LOGGER.info(f"{len(plan)} quantization targets")
 
     LOGGER.info("Packing model...")
-    fp8.pack(quant_config, model, plan, device)
+    fp8.pack(quant_config, model, plan)
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
     model.save_pretrained(quant_name)
     tokenizer.save_pretrained(quant_name)
-    utils.write_metadata(args, quant_name, device, 1)
+    utils.write_metadata(args, quant_name, torch.device("cpu"), 1)
 
 
 if __name__ == "__main__":
