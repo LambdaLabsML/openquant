@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from .utils import clean_memory
+from .utils import clean_memory, set_submodule
 from .subgraph import QuantTarget
 
 LOGGER = logging.getLogger(__name__)
@@ -188,16 +188,14 @@ def quantize(
 
     scales = torch.split(best_scale, [m.out_features for m in target.ops], dim=0)
     zeros = torch.split(best_zero, [m.out_features for m in target.ops], dim=0)
-    return best_s, scales, zeros
+    return {"s": best_s, "scales": scales, "zeros": zeros}
 
 
 @torch.inference_mode()
 def pack(
     qcfg: QuantConfig,
     model: torch.nn.Module,
-    targets: list[
-        tuple[QuantTarget, torch.Tensor, list[torch.Tensor], list[torch.Tensor]]
-    ],
+    targets: list[tuple[QuantTarget, dict]],
     pack_dtype=torch.int32,
 ):
     if qcfg.num_bits == 4:
@@ -213,9 +211,8 @@ def pack(
     assert pack_factor == len(order_map)
     LOGGER.info(f"Packing {pack_factor} int{qcfg.num_bits} into {pack_dtype}")
 
-    for target, best_s, _, _ in tqdm.tqdm(
-        targets, desc="Scaling parent ops", leave=False
-    ):
+    for target, qinfo in tqdm.tqdm(targets, desc="Scaling parent ops", leave=False):
+        best_s = qinfo["s"]
         for module in target.ops:
             assert isinstance(module, torch.nn.Linear)
             assert module.in_features == target.ops[0].in_features
@@ -255,8 +252,8 @@ def pack(
         p.numel() * p.dtype.itemsize for p in model.parameters()
     )
 
-    for target, best_s, scales, zero in targets:
-        for module, scale, zero in zip(target.ops, scales, zero):
+    for target, qinfo in targets:
+        for module, scale, zero in zip(target.ops, qinfo["scales"], qinfo["zeros"]):
             assert isinstance(module, torch.nn.Linear)
 
             w_q = qcfg.quantize_tensor(module.weight.data * best_s, scale, zero)
@@ -294,34 +291,7 @@ def pack(
             # NOTE: for vllm compatibility with tensor shapes/dtypes check here:
             # https://github.com/vllm-project/vllm/blob/v0.8.5.post1/vllm/model_executor/layers/quantization/awq.py#L98
             packed = PackedLayer(qweight, qzeros, scale, module.bias)
-
-            module_name = None
-            for name, haystack in model.named_modules():
-                if haystack == module:
-                    module_name = name
-                    break
-            assert module_name is not None
-
-            # NOTE: we have to get the owner this way because torch stores list index as `.<index>.<next part>`,
-            # and that is not compatible with getattr & lists
-            owner = model
-            name_parts = module_name.split(".")
-            for attr in name_parts[:-1]:
-                if attr.isnumeric():
-                    owner = owner[int(attr)]
-                else:
-                    owner = getattr(owner, attr)
-            setattr(owner, name_parts[-1], packed)
-
-            original_num_bytes = sum(
-                p.numel() * p.dtype.itemsize for p in module.parameters()
-            )
-            packed_num_bytes = sum(
-                p.numel() * p.dtype.itemsize for p in packed.parameters()
-            )
-            LOGGER.info(
-                f"Packed {module_name} from {original_num_bytes * 1e-6:.1f} mb to {packed_num_bytes * 1e-6:.1f} mb"
-            )
+            set_submodule(model, module, packed)
 
     model_packed_num_bytes = sum(
         p.numel() * p.dtype.itemsize for p in model.parameters()

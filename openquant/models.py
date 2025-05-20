@@ -234,7 +234,13 @@ class Llama4:
                     )
                 )
                 if include_experts:
-                    raise NotImplementedError("TODO Llama4 experts")
+                    plan.append(
+                        QuantTarget(
+                            subgraph=decoder,
+                            parent=decoder.post_attention_layernorm,
+                            ops=[decoder.feed_forward.experts],
+                        )
+                    )
             else:
                 assert isinstance(decoder.feed_forward, Llama4TextMLP)
                 plan.append(
@@ -379,22 +385,13 @@ class Qwen3:
                         )
                     )
                     if include_experts:
-                        expert: Qwen3MoeMLP
-                        for expert in decoder.mlp.experts:
-                            plan.append(
-                                QuantTarget(
-                                    subgraph=decoder,
-                                    parent=decoder.post_attention_layernorm,
-                                    ops=[expert.gate_proj, expert.up_proj],
-                                )
+                        plan.append(
+                            QuantTarget(
+                                subgraph=decoder,
+                                parent=decoder.post_attention_layernorm,
+                                ops=[decoder.mlp],
                             )
-                            plan.append(
-                                QuantTarget(
-                                    subgraph=decoder,
-                                    parent=expert.up_proj,
-                                    ops=[expert.down_proj],
-                                )
-                            )
+                        )
                 else:
                     raise NotImplementedError(type(decoder.mlp))
 

@@ -213,96 +213,12 @@ def main():
         LOGGER.info(f"Saving quantized model to {quant_name}")
         model.save_pretrained(quant_name)
         tokenizer.save_pretrained(quant_name)
-        write_metadata(args, quant_name, device, world_size)
+        utils.write_metadata(args, quant_name, device, world_size)
 
     if world_size > 1:
         LOGGER.info("Waiting for all ranks to finish before quitting.")
         dist.barrier(device_ids=[rank])
         dist.destroy_process_group()
-
-
-def write_metadata(args, metdata_dir, device: torch.device, world_size: int):
-    os.makedirs(metdata_dir, exist_ok=True)
-
-    LOGGER.info("Downloading base model readmes.")
-    hf_cache_dir = huggingface_hub.snapshot_download(args.model, allow_patterns="*.md")
-    for fname in os.listdir(hf_cache_dir):
-        if fname.endswith("md"):
-            LOGGER.info(f"Copying {hf_cache_dir}/{fname} into {metdata_dir}")
-            shutil.copy(
-                os.path.join(hf_cache_dir, fname),
-                os.path.join(metdata_dir, fname),
-            )
-
-    commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-    LOGGER.info(f"commit {commit_hash}")
-
-    assert device.type == "cuda"
-    device_name = torch.cuda.get_device_name(device)
-
-    python_command = "python"
-    if world_size > 1:
-        python_command = f"torchrun --nproc-per-node {world_size}"
-
-    new_lines = [
-        "# Quantization",
-        f"Created with [openquant](https://github.com/LambdaLabsML/openquant/tree/{commit_hash}) on `Python {sys.version}` with {world_size}x`{device_name}` GPUs.",
-        "",
-        f"Base Model: [{args.model}](https://huggingface.co/{args.model})",
-        "",
-        f"Calibrated with `{args.num_samples}` samples from `{args.dataset}`, `--batch-size {args.batch_size}`, `--seq-length {args.seq_length}`.",
-        "",
-        "## Steps to reproduce:",
-        f"1. `git clone https://github.com/LambdaLabsML/openquant`",
-        f"2. `git checkout {commit_hash}`",
-        f"3. `{python_command} {' '.join(sys.argv)}`",
-        "",
-        "## Evaluation",
-        "TODO",
-        "",
-        "# Base Model README.md",
-        "",
-    ]
-
-    with open(f"{metdata_dir}/README.md") as fp:
-        readme_content = fp.read()
-
-    metadata_start = readme_content.find("---")
-    if metadata_start >= 0:
-        metadata_end = readme_content.find("---", metadata_start + len("---")) + len(
-            "---"
-        )
-        metadata = readme_content[metadata_start:metadata_end]
-        readme_content = readme_content[:metadata_start] + readme_content[metadata_end:]
-    else:
-        metadata = "\n".join(
-            [
-                "---",
-                f'base_model: "{args.model}"',
-                "---",
-            ]
-        )
-
-    metadata = yaml.safe_load(metadata.replace("---", ""))
-    if "base_model" not in metadata:
-        metadata["base_model"] = args.model
-    if "license" not in metadata:
-        metadata["license"] = "mit"
-    metadata = "---\n" + yaml.dump(metadata) + "---\n"
-
-    new_content = "\n".join(new_lines)
-    LOGGER.info(f"Writing {new_content} into README.md")
-    with open(f"{metdata_dir}/README.md", "w") as fp:
-        fp.write(metadata + "\n" + new_content + "\n" + readme_content)
-
-    LOGGER.info(f"Dumping `pip freeze` to {metdata_dir}/openquant-requirements.txt")
-    freeze = subprocess.check_output(["pip", "freeze"]).decode()
-    with open(f"{metdata_dir}/openquant-requirements.txt", "w") as fp:
-        fp.write(freeze)
-
-    LOGGER.info(f"Dumping `args` to {metdata_dir}/openquant-args.json")
-    with open(f"{metdata_dir}/openquant-args.json", "w") as fp:
-        json.dump(vars(args), fp)
 
 
 if __name__ == "__main__":
