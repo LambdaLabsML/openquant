@@ -41,17 +41,13 @@ class Llama:
                     ],
                 )
             )
-            if (
-                decoder.self_attn.o_proj.in_features
-                in decoder.self_attn.v_proj.weight.shape
-            ):
-                plan.append(
-                    QuantTarget(
-                        subgraph=decoder,
-                        parent=decoder.self_attn.v_proj,
-                        ops=[decoder.self_attn.o_proj],
-                    )
+            plan.append(
+                QuantTarget(
+                    subgraph=decoder,
+                    parent=decoder.self_attn.v_proj,
+                    ops=[decoder.self_attn.o_proj],
                 )
+            )
             plan.append(
                 QuantTarget(
                     subgraph=decoder,
@@ -103,17 +99,13 @@ class Gemma3:
                     ],
                 )
             )
-            if (
-                decoder.self_attn.o_proj.in_features
-                in decoder.self_attn.v_proj.weight.shape
-            ):
-                plan.append(
-                    QuantTarget(
-                        subgraph=decoder,
-                        parent=decoder.self_attn.v_proj,
-                        ops=[decoder.self_attn.o_proj],
-                    )
+            plan.append(
+                QuantTarget(
+                    subgraph=decoder,
+                    parent=decoder.self_attn.v_proj,
+                    ops=[decoder.self_attn.o_proj],
                 )
+            )
             plan.append(
                 QuantTarget(
                     subgraph=decoder,
@@ -202,17 +194,13 @@ class Llama4:
                     ],
                 )
             )
-            if (
-                decoder.self_attn.o_proj.in_features
-                in decoder.self_attn.v_proj.weight.shape
-            ):
-                plan.append(
-                    QuantTarget(
-                        subgraph=decoder,
-                        parent=decoder.self_attn.v_proj,
-                        ops=[decoder.self_attn.o_proj],
-                    )
+            plan.append(
+                QuantTarget(
+                    subgraph=decoder,
+                    parent=decoder.self_attn.v_proj,
+                    ops=[decoder.self_attn.o_proj],
                 )
+            )
             if decoder.is_moe_layer:
                 assert isinstance(decoder.feed_forward, Llama4TextMoe)
                 plan.append(
@@ -302,17 +290,13 @@ class Qwen3:
                         ],
                     )
                 )
-                if (
-                    decoder.self_attn.o_proj.in_features
-                    in decoder.self_attn.v_proj.weight.shape
-                ):
-                    plan.append(
-                        QuantTarget(
-                            subgraph=decoder,
-                            parent=decoder.self_attn.v_proj,
-                            ops=[decoder.self_attn.o_proj],
-                        )
+                plan.append(
+                    QuantTarget(
+                        subgraph=decoder,
+                        parent=decoder.self_attn.v_proj,
+                        ops=[decoder.self_attn.o_proj],
                     )
+                )
                 plan.append(
                     QuantTarget(
                         subgraph=decoder,
@@ -345,18 +329,13 @@ class Qwen3:
                         ],
                     )
                 )
-
-                if (
-                    decoder.self_attn.o_proj.in_features
-                    in decoder.self_attn.v_proj.weight.shape
-                ):
-                    plan.append(
-                        QuantTarget(
-                            subgraph=decoder,
-                            parent=decoder.self_attn.v_proj,
-                            ops=[decoder.self_attn.o_proj],
-                        )
+                plan.append(
+                    QuantTarget(
+                        subgraph=decoder,
+                        parent=decoder.self_attn.v_proj,
+                        ops=[decoder.self_attn.o_proj],
                     )
+                )
 
                 if isinstance(decoder.mlp, Qwen3MoeMLP):
                     plan.append(
