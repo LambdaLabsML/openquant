@@ -21,7 +21,7 @@ def main():
         help="The base model. Should be huggingface tag.",
         required=True,
     )
-    parser.add_argument("--weight-block-size", default=None, type=int)
+    parser.add_argument("-w", "--weight-block-size", default=None, type=int)
     args = parser.parse_args()
 
     model_name = os.path.basename(args.model)
