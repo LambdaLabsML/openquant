@@ -57,7 +57,7 @@ class QuantConfig:
             scale = scale.reshape(*shape, 1, 1)
         y = (x.float() / scale).clamp(min=self.min_value, max=self.max_value)
         y = y.to(x.dtype).to(self.dtype)
-        y = y.reshape(x.shape)
+        y = y.reshape(*shape, N, K)
         return y
 
     def dequantize_tensor(self, x: torch.Tensor, scale: torch.Tensor):
@@ -72,8 +72,9 @@ class QuantConfig:
         else:
             assert scale.shape == torch.Size([*shape])
             scale = scale.reshape(*shape, 1, 1)
-        x = x * scale
-        return x.reshape(*shape, N, K)
+        y = x * scale
+        y = y.reshape(*shape, N, K)
+        return y
 
     def compute_scale(self, x: torch.Tensor) -> torch.Tensor:
         assert x.ndim >= 2 and x.is_contiguous()
@@ -85,9 +86,12 @@ class QuantConfig:
             dims_to_reduce = [x.ndim - 3, x.ndim - 1]
         else:
             dims_to_reduce = [x.ndim - 2, x.ndim - 1]
-        return (x.float().abs().amax(dim=dims_to_reduce) / self.max_value).clamp(
+        scale = (x.float().abs().amax(dim=dims_to_reduce) / self.max_value).clamp(
             min=1e-6
         )
+        if self.weight_block_size is not None:
+            scale = scale.to(x.dtype)
+        return scale
 
 
 @torch.inference_mode()
