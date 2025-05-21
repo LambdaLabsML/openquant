@@ -87,7 +87,9 @@ class QuantConfig:
         else:
             dims_to_reduce = [x.ndim - 2, x.ndim - 1]
         scale = (x.float().abs().amax(dim=dims_to_reduce) / self.max_value).clamp(
-            min=1e-6
+            # NOTE: special value found from vllm https://github.com/vllm-project/vllm/blob/v0.9.0/csrc/quantization/utils.cuh#L50
+            min=1.0
+            / (512.0 * self.min_value)
         )
         if self.weight_block_size is not None:
             scale = scale.to(x.dtype)
