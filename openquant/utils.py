@@ -106,8 +106,19 @@ def write_metadata(args, metdata_dir, device: torch.device, world_size: int):
                 os.path.join(metdata_dir, fname),
             )
 
-    commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-    LOGGER.info(f"commit {commit_hash}")
+    try:
+        commit_name = (
+            subprocess.check_output(["git", "describe", "--exact-match", "--tags"])
+            .decode()
+            .strip()
+        )
+        LOGGER.info(f"tag {commit_name}")
+    except subprocess.CalledProcessError:
+        LOGGER.info("Unable to get current tag, using git tag instead")
+        commit_name = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+        )
+        LOGGER.info(f"commit {commit_name}")
 
     device_name = "1 CPUs"
     if device.type == "cuda":
@@ -127,18 +138,15 @@ def write_metadata(args, metdata_dir, device: torch.device, world_size: int):
 
     new_lines = [
         "# Quantization",
-        f"Created with [openquant](https://github.com/LambdaLabsML/openquant/tree/{commit_hash}) on `Python {sys.version}` with {device_name}",
+        f"Created with [openquant](https://github.com/LambdaLabsML/openquant/tree/{commit_name}) on `Python {sys.version}` with {device_name}",
         "",
         f"Base Model: [{args.model}](https://huggingface.co/{args.model})",
         *calibration_lines,
         "",
         "## Steps to reproduce:",
         f"1. `git clone https://github.com/LambdaLabsML/openquant`",
-        f"2. `git checkout {commit_hash}`",
+        f"2. `git checkout {commit_name}`",
         f"3. `{python_command} {' '.join(sys.argv)}`",
-        "",
-        "## Evaluation",
-        "TODO",
         "",
         "# Base Model README.md",
         "",
