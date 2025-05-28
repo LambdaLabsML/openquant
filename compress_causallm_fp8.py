@@ -27,7 +27,7 @@ def main():
     model_name = os.path.basename(args.model)
     quant_name = f"{model_name}-FP8"
     if args.weight_block_size is not None:
-        quant_name = f"{model_name}-FP8-W{args.weight_block_size}"
+        quant_name += f"-W{args.weight_block_size}"
 
     logging.basicConfig(level=logging.INFO)
 

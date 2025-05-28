@@ -130,14 +130,14 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
                     num_experts = experts.num_experts
                     intermediate_size = experts.intermediate_size
                     hidden_size = experts.hidden_size
-                    gate, up = (
-                        experts.gate_up_proj.permute(0, 2, 1)
-                        .reshape(num_experts, 2, intermediate_size, hidden_size)
-                        .unbind(dim=1)
+                    gu = experts.gate_up_proj.permute(0, 2, 1).reshape(
+                        num_experts, 2, intermediate_size, hidden_size
                     )
-                    gates = gate.unbind()
-                    ups = up.unbind()
-                    downs = experts.down_proj.permute(0, 2, 1).unbind()
+                    gate, up = gu.unbind(dim=1)
+                    down = experts.down_proj.permute(0, 2, 1)
+                    gates = [g.contiguous() for g in gate.unbind()]
+                    ups = [u.contiguous() for u in up.unbind()]
+                    downs = [d.contiguous() for d in down.unbind()]
 
                 assert all(
                     g.shape == torch.Size([intermediate_size, hidden_size])
