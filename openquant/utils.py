@@ -93,18 +93,30 @@ def set_submodule(
     return module_name
 
 
-def write_metadata(args, metdata_dir, device: torch.device, world_size: int):
+def write_metadata(args, metdata_dir, model, device: torch.device, world_size: int):
     os.makedirs(metdata_dir, exist_ok=True)
 
     LOGGER.info("Downloading base model readmes.")
-    hf_cache_dir = huggingface_hub.snapshot_download(args.model, allow_patterns="*.md")
+    hf_cache_dir = huggingface_hub.snapshot_download(
+        args.model, allow_patterns=["*.md", "*.json"]
+    )
     for fname in os.listdir(hf_cache_dir):
-        if fname.endswith("md"):
-            LOGGER.info(f"Copying {hf_cache_dir}/{fname} into {metdata_dir}")
-            shutil.copy(
-                os.path.join(hf_cache_dir, fname),
-                os.path.join(metdata_dir, fname),
-            )
+        if fname == "model.safetensors.index.json":
+            continue
+        if fname.endswith("md") or fname.endswith("json"):
+            dst = os.path.join(metdata_dir, fname)
+            if os.path.exists(dst):
+                LOGGER.info(f"Restoring {dst}")
+            else:
+                LOGGER.info(f"Copying {dst}")
+            shutil.copy(os.path.join(hf_cache_dir, fname), dst)
+
+    LOGGER.info("Adding quantization_config into config.json")
+    with open(f"{metdata_dir}/config.json") as fp:
+        config = json.load(fp)
+    config["quantization_config"] = model.config.quantization_config
+    with open(f"{metdata_dir}/config.json", "w") as fp:
+        json.dump(config, fp, indent=2)
 
     try:
         commit_name = (

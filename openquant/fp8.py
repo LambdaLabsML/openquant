@@ -77,7 +77,7 @@ class QuantConfig:
         return y
 
     def compute_scale(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.ndim >= 2 and x.is_contiguous()
+        assert x.ndim >= 2
         *shape, N, K = x.shape
         if self.weight_block_size is not None:
             n, k = self.weight_block_size
@@ -106,6 +106,11 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
     if qcfg.weight_block_size is not None:
         packed_linear = PackedBlockLinear
 
+    ignored_layers = set()
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            ignored_layers.add(name)
+
     for target in targets:
         for module in target.ops:
             if isinstance(module, torch.nn.Linear):
@@ -113,7 +118,9 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
                 scale = qcfg.compute_scale(w)
                 q = qcfg.quantize_tensor(w, scale)
                 packed = packed_linear(q, scale)
-                set_submodule(model, module, packed)
+                ignored_layers.discard(set_submodule(model, module, packed))
+                module.to("meta")
+
             elif isinstance(module, Qwen3MoeSparseMoeBlock) or isinstance(
                 module, Llama4TextExperts
             ):
@@ -135,9 +142,9 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
                     )
                     gate, up = gu.unbind(dim=1)
                     down = experts.down_proj.permute(0, 2, 1)
-                    gates = [g.contiguous() for g in gate.unbind()]
-                    ups = [u.contiguous() for u in up.unbind()]
-                    downs = [d.contiguous() for d in down.unbind()]
+                    gates = [g for g in gate.unbind()]
+                    ups = [u for u in up.unbind()]
+                    downs = [d for d in down.unbind()]
 
                 assert all(
                     g.shape == torch.Size([intermediate_size, hidden_size])
@@ -178,6 +185,8 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
 
                 set_submodule(model, experts, torch.nn.ModuleList(packed_experts))
 
+                experts.to("meta")
+
             else:
                 raise NotImplementedError(target.ops)
 
@@ -188,12 +197,14 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
         "weight_block_size": (
             None if qcfg.weight_block_size is None else list(qcfg.weight_block_size)
         ),
+        "ignored_layers": list(ignored_layers),
     }
 
     model_packed_num_bytes = sum(
         p.numel() * p.dtype.itemsize for p in model.parameters()
     )
 
+    LOGGER.info(f"Ignored {ignored_layers}")
     LOGGER.info(
         f"Model compressed from {model_original_num_bytes * 1e-9:.1f} gb to {model_packed_num_bytes * 1e-9:.1f} gb"
     )

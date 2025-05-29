@@ -3,7 +3,7 @@ import os
 import logging
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 
 from openquant import *
 
@@ -39,12 +39,8 @@ def main():
     quant_config = fp8.QuantConfig(weight_block_size=weight_block_size)
     LOGGER.info(f"Using {quant_config}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
     LOGGER.info(f"Loading {args.model}")
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype="auto")
+    model = AutoModel.from_pretrained(args.model, torch_dtype="auto")
 
     plan = models.make_plan(model, include_experts=True)
     LOGGER.info(f"{len(plan)} quantization targets")
@@ -54,8 +50,7 @@ def main():
 
     LOGGER.info(f"Saving quantized model to {quant_name}")
     model.save_pretrained(quant_name)
-    tokenizer.save_pretrained(quant_name)
-    utils.write_metadata(args, quant_name, torch.device("cpu"), 1)
+    utils.write_metadata(args, quant_name, model, torch.device("cpu"), 1)
 
 
 if __name__ == "__main__":

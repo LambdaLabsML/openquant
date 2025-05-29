@@ -213,7 +213,7 @@ def main():
         LOGGER.info(f"Saving quantized model to {quant_name}")
         model.save_pretrained(quant_name)
         tokenizer.save_pretrained(quant_name)
-        utils.write_metadata(args, quant_name, device, world_size)
+        utils.write_metadata(args, quant_name, model, device, world_size)
 
     if world_size > 1:
         LOGGER.info("Waiting for all ranks to finish before quitting.")
