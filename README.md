@@ -6,6 +6,7 @@ Simple quantization, compatible with vllm/sglang.
 git clone https://github.com/LambdaLabsML/openquant.git
 cd openquant
 python compress_causallm_fp8.py -m Qwen/Qwen3-32B
+vllm serve Qwen3-32B-FP8/
 ```
 
 ## Model support
@@ -19,26 +20,14 @@ python compress_causallm_fp8.py -m Qwen/Qwen3-32B
 ## Quantization algorithm support
 
 - [x] fp8
-- [ ] fp4
 - [x] AWQ
+- [ ] fp4
 - [ ] GPTQ
 - [ ] GGUF
 
 ## Contributing new model architectures
 
 See examples in [openquant/models.py](openquant/models.py).
-
-## How FP8 works
-
-TODO
-
-## How AWQ works
-
-TODO
-
-### Carrying network inputs through quantization
-
-TODO
 
 # License
 
