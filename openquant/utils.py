@@ -101,7 +101,8 @@ def write_metadata(args, metdata_dir, model, device: torch.device, world_size: i
         args.model, allow_patterns=["*.md", "*.json"]
     )
     for fname in os.listdir(hf_cache_dir):
-        if "safetensors" in fname:
+        src = os.path.join(hf_cache_dir, fname)
+        if "safetensors" in fname or os.path.isdir(src):
             continue
 
         dst = os.path.join(metdata_dir, fname)
@@ -109,7 +110,7 @@ def write_metadata(args, metdata_dir, model, device: torch.device, world_size: i
             LOGGER.info(f"Restoring {dst}")
         else:
             LOGGER.info(f"Copying {dst}")
-        shutil.copy(os.path.join(hf_cache_dir, fname), dst)
+        shutil.copy(src, dst)
 
     LOGGER.info("Adding quantization_config into config.json")
     with open(f"{metdata_dir}/config.json") as fp:
