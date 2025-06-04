@@ -3,7 +3,7 @@ import os
 import logging
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
+from transformers import AutoModel, AutoConfig, AutoModelForCausalLM
 
 from openquant import *
 
@@ -39,8 +39,15 @@ def main():
     quant_config = fp8.QuantConfig(weight_block_size=weight_block_size)
     LOGGER.info(f"Using {quant_config}")
 
-    LOGGER.info(f"Loading {args.model}")
-    model = AutoModel.from_pretrained(args.model, torch_dtype="auto")
+    config = AutoConfig.from_pretrained(args.model)
+    if "ForConditionalGeneration" in config.architectures[0]:
+        loader_cls = AutoModel
+    else:
+        assert "ForCausalLM"
+        loader_cls = AutoModelForCausalLM
+
+    LOGGER.info(f"Loading {args.model} with {loader_cls.__name__}")
+    model = loader_cls.from_pretrained(args.model, torch_dtype="auto")
 
     plan = models.make_plan(model, include_experts=True)
     LOGGER.info(f"{len(plan)} quantization targets")

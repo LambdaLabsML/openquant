@@ -183,7 +183,10 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
                         )
                     )
 
-                set_submodule(model, experts, torch.nn.ModuleList(packed_experts))
+                name = set_submodule(
+                    model, experts, torch.nn.ModuleList(packed_experts)
+                )
+                ignored_layers = {l for l in ignored_layers if not l.startswith(name)}
 
                 experts.to("meta")
 
