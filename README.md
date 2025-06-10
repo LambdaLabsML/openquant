@@ -42,14 +42,53 @@ The main reason for quantizing a model from `bf16` to `fp8` is memory reduction.
 Starting with NVIDIA H100 GPU, GPUs have **hardware support** for 8 bit floating point numbers (`fp8`), meaning `fp8` performance is >= `bf16` performance (mostly).
 
 tl;dr:
-1. Halve the memory requirements [1]
-2. Faster than bf16 due to less memory bandwidth
+1. Halve (approximately) the memory requirements [1]
+2. Can be faster than bf16 due to less memory bandwidth
 
-[1] Less memory also means extra space for KV Cache storage, making modern inference libraries faster.
+[1] Less memory also means extra space for KV Cache storage, making modern inference libraries more stable.
 
 ### fp8: How?
 
+#### fp8 vs bf16 numerical format
 
+- talk about format & range & precision
+
+#### Scaling tensors
+
+1. Computing the scale
+2. Quantizing 
+2. single float scale
+3. tensor of scales
+
+### fp8: Saving an inference compatible model checkpoint
+
+For compatibility with things like VLLM there's a couple things we need to do:
+
+1. Add the `weight_scale` as a parameter to each of the `Linear` layers. This basically means just replace the `Linear` layer with this `PackedLinear`, where `weight` is the `fp8` tensor, and `weight_scale` is the scale.
+
+```python
+class PackedLinear(torch.nn.Module):
+    def __init__(self, weight: torch.Tensor, weight_scale: torch.Tensor):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+```
+
+2. Add a `quantization_config` into the model's config. This will also appear in the `config.json` file in the huggingface repo of the model.
+
+```python
+model.config.quantization_config = {
+    "quant_method": "fp8",
+    "is_checkpoint_fp8_serialized": True,
+    "activation_scheme": "dynamic",
+    "weight_block_size": ..., # `None` or `[block_size, block_size]`
+    "ignored_layers": ..., # list of module names that are not quantized
+}
+```
+
+And that's all we need to do for vllm!
+
+**NOTE: some models don't support all layers being quantized. For example, vllm does not support the `decoder.mlp.gate` linear layer being quantized in Qwen3 MoE models.**
 
 # License
 

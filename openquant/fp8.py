@@ -214,11 +214,7 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
 
 
 class PackedLinear(torch.nn.Module):
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-    ):
+    def __init__(self, weight: torch.Tensor, weight_scale: torch.Tensor):
         super().__init__()
         self.weight = torch.nn.Parameter(weight, requires_grad=False)
         self.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
@@ -228,11 +224,7 @@ class PackedLinear(torch.nn.Module):
 
 
 class PackedBlockLinear(torch.nn.Module):
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-    ):
+    def __init__(self, weight: torch.Tensor, weight_scale: torch.Tensor):
         super().__init__()
         self.weight = torch.nn.Parameter(weight, requires_grad=False)
         # NOTE: no idea why this is called weight_scale_inv, they are treated the same,
