@@ -71,7 +71,7 @@ tensor([-0.281250, -0.218750, -0.500000,  0.562500,  0.500000,  1.750000])
 And here is how all the representable values are distributed (notice how there are waaaaay more values closer to 0!
 ):
 
-TODO insert graphic
+![image](https://github.com/user-attachments/assets/a2eefa93-5f0a-4154-b78a-0964403ff57f)
 
 So this leads us with two questions for quantization:
 
