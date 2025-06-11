@@ -151,17 +151,14 @@ def write_metadata(args, metdata_dir, model, device: torch.device, world_size: i
 
     new_lines = [
         "# Quantization",
-        f"Created with [openquant](https://github.com/LambdaLabsML/openquant/tree/{commit_name}) on `Python {sys.version}` with {device_name}",
+        f"Created with [openquant](https://github.com/LambdaLabsML/openquant/) on `Python {sys.version}` with {device_name}",
         "",
         f"Base Model: [{args.model}](https://huggingface.co/{args.model})",
         *calibration_lines,
         "",
         "## Steps to reproduce:",
         f"1. `git clone https://github.com/LambdaLabsML/openquant`",
-        f"2. `git checkout {commit_name}`",
-        f"3. `{python_command} {' '.join(sys.argv)}`",
-        "",
-        "# Base Model README.md",
+        f"2. `{python_command} {' '.join(sys.argv)}`",
         "",
     ]
 
