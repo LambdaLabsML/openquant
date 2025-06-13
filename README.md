@@ -80,18 +80,37 @@ So this leads us with two questions for quantization:
 
 #### Scaling to lower precision loss & handle large values
 
-When quantizing a tensor from `bf16` to `fp8`, we don't just convert it to the dtype like I showed above.
+Since `bf16` and `fp8` have different ranges, we need to scale the values to fit into the `fp8` range. This scale is based
+on the max value of the data at `bf16`, and is roughly computed like:
 
-Instead we do the following:
-1. Compute the largest value of the tensor (the scale)
-2. Divide the tensor by the scale (so the values are between min value and max value)
-3. Store both the quantized tensor & the scale
+```python
+# NOTE: this will be a single value
+scale = x.abs().amax() / 448
+```
 
-We need to compute & store this scale to handle values that are larger than the range that fp8 can store (-448 to 448).
+Then once we have the scale we can quantize the `bf16` tensor:
 
-Let's see this in action:
+```python
+x_quantized = (x / scale).clamp(min=-448, max=448).to(torch.float8_e4m3fn)
+```
 
-TODO
+##### Weight block size
+
+There's also an option of having `scale` being based on the input tensor size, and a block size. If you look at some popular open source fp8 models they typically use this option.
+
+Why would you do this? To theoretically preserve accuracy, though if the values in your tensor are all relatively close together you won't get much benefit.
+
+Given a weight_block_size of `[128, 128]`, and a tensor of shape `[N, K]`, the scale will be of size `[N // 128, K // 128]`:
+
+E.g. assuming x is 2d, we have the code:
+
+```python
+N, K = x.shape
+n, k = weight_block_size
+x = x.reshape(N // n, n, K // k, k)
+scale = x.abs().amax(dim=[1, 3]) / 448
+assert scale.shape == torch.Size([N // n, K // k])
+```
 
 ### fp8: Saving an inference compatible model checkpoint
 
