@@ -42,7 +42,7 @@ Starting with NVIDIA H100 GPU, GPUs have *hardware support* for 8 bit floating p
 
 1. Model takes less GPU ram => more space for kv cache. Modern inference libraries (like vllm/sglang) will have higher/more stable performance with more space for kv cache
 2. Model parameters are half as big => less GPU memory bandwidth
-3. Depending on the GPU, fp8 flops are just higher than bf16 flops. E.g. See [H100 specifications](https://www.nvidia.com/en-us/data-center/h100/); bfloat16 has ~2k teraFLOPS and fp8 has ~4k teraFLOPS
+3. Depending on the GPU, fp8 FLOPS are just higher than bf16 FLOPS. E.g. See [H100 specifications](https://www.nvidia.com/en-us/data-center/h100/); bfloat16 has ~2k teraFLOPS and fp8 has ~4k teraFLOPS
 
 
 ### fp8: How?
@@ -63,8 +63,6 @@ There are a number of different fp8 formats; the most common is `float8_e4m3fn`.
 3. Cannot represent `infinity` (the `fn` postfix stands for "finite numbers only" - there are other fp8 formats that do support infinity)
 4. Can represent `NaN`
 5. Model parameters are typically stored using this format (note that `inf` is not usually present in pretrained model parameters)
-
-
 
 <details>
     <summary>
