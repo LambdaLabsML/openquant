@@ -22,13 +22,6 @@ class QuantConfig:
         dtype: torch.dtype = torch.float8_e4m3fn,
         weight_block_size: Optional[tuple[int, int]] = None,
     ):
-        if dtype == torch.float8_e5m2:
-            self.mantissa_bits = 2
-        elif dtype == torch.float8_e4m3fn:
-            self.mantissa_bits = 3
-        else:
-            raise NotImplementedError(dtype)
-
         if weight_block_size is not None:
             assert len(weight_block_size) == 2 and all(
                 isinstance(w, int) for w in weight_block_size
@@ -43,24 +36,10 @@ class QuantConfig:
     def __repr__(self):
         return f"QuantConfig(dtype={self.dtype}, weight_block_size={self.weight_block_size})"
 
-    def quantize_tensor(self, x: torch.Tensor, scale: torch.Tensor):
-        assert x.ndim >= 2
-        *shape, N, K = x.shape
-        if self.weight_block_size is not None:
-            n, k = self.weight_block_size
-            assert N % n == 0 and K % k == 0
-            x = x.reshape(*shape, N // n, n, K // k, k)
-            assert scale.shape == torch.Size([*shape, N // n, K // k])
-            scale = scale.reshape(*shape, N // n, 1, K // k, 1)
-        else:
-            assert scale.shape == torch.Size([*shape])
-            scale = scale.reshape(*shape, 1, 1)
-        y = (x.float() / scale).clamp(min=self.min_value, max=self.max_value)
-        y = y.to(x.dtype).to(self.dtype)
-        y = y.reshape(*shape, N, K)
-        return y
+    def quantize_tensor(self, x: torch.Tensor, scale: torch.Tensor=None):
+        if scale is None:
+            scale = self.compute_scale(x)
 
-    def dequantize_tensor(self, x: torch.Tensor, scale: torch.Tensor):
         assert x.ndim >= 2
         *shape, N, K = x.shape
         if self.weight_block_size is not None:
@@ -68,13 +47,14 @@ class QuantConfig:
             assert N % n == 0 and K % k == 0
             x = x.reshape(*shape, N // n, n, K // k, k)
             assert scale.shape == torch.Size([*shape, N // n, K // k])
-            scale = scale.reshape(*shape, N // n, 1, K // k, 1)
+            block_scale = scale.reshape(*shape, N // n, 1, K // k, 1)
         else:
             assert scale.shape == torch.Size([*shape])
-            scale = scale.reshape(*shape, 1, 1)
-        y = x * scale
+            block_scale = scale.reshape(*shape, 1, 1)
+        y = (x.float() / block_scale).clamp(min=self.min_value, max=self.max_value)
+        y = y.to(self.dtype)
         y = y.reshape(*shape, N, K)
-        return y
+        return y, scale
 
     def compute_scale(self, x: torch.Tensor) -> torch.Tensor:
         assert x.ndim >= 2
@@ -86,11 +66,10 @@ class QuantConfig:
             dims_to_reduce = [x.ndim - 3, x.ndim - 1]
         else:
             dims_to_reduce = [x.ndim - 2, x.ndim - 1]
-        scale = (x.float().abs().amax(dim=dims_to_reduce) / self.max_value).clamp(
-            # NOTE: special value found from vllm https://github.com/vllm-project/vllm/blob/v0.9.0/csrc/quantization/utils.cuh#L50
-            min=1.0
-            / (512.0 * self.min_value)
-        )
+        absmax = x.float().abs().amax(dim=dims_to_reduce)
+        # NOTE: special value found from vllm https://github.com/vllm-project/vllm/blob/v0.9.0/csrc/quantization/utils.cuh#L50
+        scale = absmax / self.max_value
+        scale = scale.clamp(min=1.0 / (512.0 * self.min_value))
         if self.weight_block_size is not None:
             scale = scale.to(x.dtype)
         return scale
@@ -114,10 +93,7 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
     for target in targets:
         for module in target.ops:
             if isinstance(module, torch.nn.Linear):
-                w = module.weight
-                scale = qcfg.compute_scale(w)
-                q = qcfg.quantize_tensor(w, scale)
-                packed = packed_linear(q, scale)
+                packed = packed_linear(*qcfg.quantize_tensor(module.weight))
                 ignored_layers.discard(set_submodule(model, module, packed))
                 module.to("meta")
 
@@ -166,20 +142,11 @@ def pack(qcfg: QuantConfig, model: torch.nn.Module, targets: list[QuantTarget]):
 
                 packed_experts = []
                 for gate, up, down in zip(gates, ups, downs):
-                    gate_scale = qcfg.compute_scale(gate)
-                    gate_q = qcfg.quantize_tensor(gate, gate_scale)
-
-                    up_scale = qcfg.compute_scale(up)
-                    up_q = qcfg.quantize_tensor(up, up_scale)
-
-                    down_scale = qcfg.compute_scale(down)
-                    down_q = qcfg.quantize_tensor(down, down_scale)
-
                     packed_experts.append(
                         PackedMlp(
-                            down_proj=packed_linear(down_q, down_scale),
-                            gate_proj=packed_linear(gate_q, gate_scale),
-                            up_proj=packed_linear(up_q, up_scale),
+                            down_proj=packed_linear(*qcfg.quantize_tensor(down)),
+                            gate_proj=packed_linear(*qcfg.quantize_tensor(gate)),
+                            up_proj=packed_linear(*qcfg.quantize_tensor(up)),
                         )
                     )
 
