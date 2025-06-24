@@ -1,28 +1,41 @@
-# openquant
+---
+# ---------- Core metadata ----------
+title:  "Everything about fp8 quantization"
+subtitle: "Boosting inference throughput and reducing memory footprint"
+description: >
+  Describes the fp8 format, why you would quantize a model to fp8, and how to do it.
+keywords:
+  - fp8
+  - f8
+  - quantization
+  - pytorch
+  - inference
 
-Simple quantization, compatible with vllm/sglang.
+# ---------- Authorship ----------
+author-meta: "Corey Lowman"
+authors:
+  - name: "Corey Lowman"
+    affiliations:
+      - 1
+      - ' *'
+affiliations:
+  - id: 1
+    name: "Lambda, Inc."
 
-```bash
-git clone https://github.com/LambdaLabsML/openquant.git
-cd openquant
-python compress_fp8.py -m Qwen/Qwen3-32B
-vllm serve Qwen3-32B-FP8
-```
 
-Model/quantization support:
+# ---------- Links shown as buttons ----------
+links:
+  - label: "Code (GitHub)"
+    url: "https://github.com/LambdaLabsML/openquant"
+    icon: "code"
 
-| Model     | fp8  | awq | 
-| --------  | ---- | --- |
-| Qwen3     | ✅    | ✅  |
-| Qwen3 MoE | ✅    | *   |
-| Llama 3   | ✅    | ✅  |
-| Llama 4   | ✅    |  *  |
-| Gemma 3   | ✅    | ✅ |
-| Mistral   | ✅    | ✅ |
+# ---------- Footer ----------
+owner:  "Lambda, Inc."
+year:   2025
+license: "MIT"
+license_url: "https://opensource.org/license/mit"
+---
 
-\* AWQ can't really handle MoE models
-
-For contributing new model architectures, see examples in [openquant/models.py](openquant/models.py).
 
 ## Everything about 8 bit float (`fp8`) quantization
 
