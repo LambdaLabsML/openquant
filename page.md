@@ -35,17 +35,27 @@ license: "MIT"
 license_url: "https://opensource.org/license/mit"
 ---
 
-Table of contents:
 
-- [fp8: Why?](#fp8-why)
-- [fp8: How?](#fp8-how)
+Quick Jump:
+<div>
+  <ol>
+    <li><a href="#why">Why?</a></li>
+    <li><a href="#how">How?</a></li>
+    <li><a href="#saving-a-quantized-checkpoint">Saving a quantized checkpoint</a></li>
+  </ol>
+</div>
+
+- [Why?](#why)
+- [How?](#how)
   - [Note on executing fp8 models](#note-on-executing-fp8-models)
   - [fp8 bit format](#fp8-bit-format)
   - [Quantization - scaling to lower precision loss \& handle large values](#quantization---scaling-to-lower-precision-loss--handle-large-values)
   - [Finer grained scale - weight block size](#finer-grained-scale---weight-block-size)
-- [Saving an inference compatible model checkpoint](#saving-an-inference-compatible-model-checkpoint)
+- [Saving a quantized checkpoint](#saving-a-quantized-checkpoint)
+  - [Add the scales to `Linear` layers](#add-the-scales-to-linear-layers)
+  - [Update model config](#update-model-config)
 
-# fp8: Why?
+# Why?
 
 tl;dr:
 
@@ -60,20 +70,20 @@ Starting with NVIDIA H100 GPU, GPUs have *hardware support* for 8 bit floating p
 
 1. Model takes less GPU ram => more space for kv cache. Modern inference libraries (like vllm/sglang) will have higher/more stable performance with more space for kv cache
 2. Model parameters are half as big => less GPU memory bandwidth
-3. Depending on the GPU, fp8 FLOPS are just higher than bf16 FLOPS. E.g. See [H100 specifications](https://www.nvidia.com/en-us/data-center/h100/); bfloat16 has ~2k teraFLOPS and fp8 has ~4k teraFLOPS
+3. Depending on the GPU, fp8 FLOPS are just higher than `bf16` FLOPS. E.g. See [H100 specifications](https://www.nvidia.com/en-us/data-center/h100/); bfloat16 has ~2k teraFLOPS and fp8 has ~4k teraFLOPS
 
 
-# fp8: How?
+# How?
 
 ## Note on executing fp8 models
 
-When we talk about fp8 models, we typically only are talking about the **weights being fp8**. The actual execution of the model is still done in `bf16`. So all the **intermediate tensors are still in bf16**, and it's the underlying CUDA kernels that are taking in bf16 tensors and fp8 weights.
+When we talk about `fp8` models, we typically only are talking about the **weights being `fp8`**. The actual execution of the model is still done in `bf16`. So all the **intermediate tensors are still in `bf16`**, and it's the underlying CUDA kernels that are taking in `bf16` tensors and `fp8` weights.
 
 **fp8 models still use `bf16` kv cache by default** (since the kv cache stores kv values, which are intermediate tensors).
 
 ## fp8 bit format
 
-There are a number of different fp8 formats; the most common is `float8_e4m3fn`. Here are some facts about it:
+There are a number of different `fp8` formats; the most common is `float8_e4m3fn`. Here are some facts about it:
 
 1. This format has `1` sign bit, `4` bits for exponent (`e4`), and `3` bits for mantissa (`m3`)
 2. Values can be between `[-448, +448]`
@@ -101,8 +111,8 @@ And here is how all the representable values are distributed (notice how there a
 
 So this leads us with two questions for quantization:
 
-1. `bf16` can store values between `[-3.38953e+38, +3.38953e+38]`, how do we fit that into fp8 range of `[-448, +448]`?
-2. How do we take advantage of the distribution of values in fp8?
+1. `bf16` can store values between `[-3.38953e+38, +3.38953e+38]`, how do we fit that into `fp8` range of `[-448, +448]`?
+2. How do we take advantage of the distribution of values in `fp8`?
 
 ## Quantization - scaling to lower precision loss & handle large values
 
@@ -126,7 +136,7 @@ x_dequantized = x.to(torch.bfloat16) * scale
 
 ## Finer grained scale - weight block size
 
-Above I showed the scale being a single value, but you can also have it be a tensor. If you look at some popular open source fp8 models they typically use this option.
+Above I showed the scale being a single value, but you can also have it be a tensor. If you look at some popular open source `fp8` models they typically use this option.
 
 Why would you do this? To theoretically preserve accuracy, though if the values in your tensor are all relatively close together you won't get much benefit.
 
@@ -142,11 +152,13 @@ scale = x.abs().amax(dim=[1, 3]) / 448
 assert scale.shape == torch.Size([N // n, K // k])
 ```
 
-# Saving an inference compatible model checkpoint
+# Saving a quantized checkpoint
 
 For compatibility with things like VLLM there's a couple things we need to do:
 
-1. Add the `weight_scale` as a parameter to each of the `Linear` layers. This basically means just replace the `Linear` layer with this `PackedLinear` class, where `weight` is the `fp8` tensor, and `weight_scale` is the scale.
+## Add the scales to `Linear` layers
+
+We need to add the previously computed `weight_scale` as a parameter to each of the `Linear` layers. This basically means just replace the `Linear` layer with this custom `PackedLinear` class, where `weight` is the `fp8` tensor, and `weight_scale` is the scale from previous sections.
 
 ```python
 class PackedLinear(torch.nn.Module):
@@ -156,7 +168,9 @@ class PackedLinear(torch.nn.Module):
         self.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 ```
 
-2. Add a `quantization_config` into the model's config. This will also appear in the `config.json` file in the huggingface repo of the model.
+## Update model config
+
+This part is really easy, just add a `quantization_config` into the model's config. This will also appear in the `config.json` file in the huggingface repo of the model.
 
 ```python
 model.config.quantization_config = {
