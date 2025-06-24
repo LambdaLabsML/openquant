@@ -14,11 +14,13 @@ Model/quantization support:
 | Model     | fp8  | awq | 
 | --------  | ---- | --- |
 | Qwen3     | ✅    | ✅  |
-| Qwen3 MoE | ✅    |    |
+| Qwen3 MoE | ✅    | *   |
 | Llama 3   | ✅    | ✅  |
-| Llama 4   | ✅    |    |
+| Llama 4   | ✅    |  *  |
 | Gemma 3   | ✅    | ✅ |
 | Mistral   | ✅    | ✅ |
+
+\* AWQ can't really handle MoE models
 
 For contributing new model architectures, see examples in [openquant/models.py](openquant/models.py).
 
