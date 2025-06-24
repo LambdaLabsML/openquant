@@ -22,7 +22,7 @@ Model/quantization support:
 
 For contributing new model architectures, see examples in [openquant/models.py](openquant/models.py).
 
-## Everything about `fp8` quantization
+## Everything about 8 bit float (`fp8`) quantization
 
 ```bash
 python compress_fp8.py -m Qwen/Qwen3-32B
@@ -49,7 +49,7 @@ Starting with NVIDIA H100 GPU, GPUs have *hardware support* for 8 bit floating p
 
 #### Note on executing fp8 models
 
-When we talk about fp8 models, we typically only are talking about the **weights being fp8**. The actual execution of the model is still done in bf16. So all the **intermediate tensors are still in bf16**, and it's the underlying CUDA kernels that are taking in bf16 tensors and fp8 weights.
+When we talk about fp8 models, we typically only are talking about the **weights being fp8**. The actual execution of the model is still done in `bf16`. So all the **intermediate tensors are still in bf16**, and it's the underlying CUDA kernels that are taking in bf16 tensors and fp8 weights.
 
 **fp8 models still use `bf16` kv cache by default** (since the kv cache stores kv values, which are intermediate tensors).
 
@@ -153,27 +153,3 @@ model.config.quantization_config = {
 And that's all we need to do for vllm!
 
 **NOTE: some models don't support all layers being quantized. For example, vllm does not support the `decoder.mlp.gate` linear layer being quantized in Qwen3 MoE models.**
-
-# License
-
-MIT License
-
-Copyright (c) 2025 Lambda Labs Inc.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
