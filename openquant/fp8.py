@@ -36,7 +36,7 @@ class QuantConfig:
     def __repr__(self):
         return f"QuantConfig(dtype={self.dtype}, weight_block_size={self.weight_block_size})"
 
-    def quantize_tensor(self, x: torch.Tensor, scale: torch.Tensor=None):
+    def quantize_tensor(self, x: torch.Tensor, scale: torch.Tensor = None):
         if scale is None:
             scale = self.compute_scale(x)
 
