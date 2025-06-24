@@ -37,8 +37,6 @@ license_url: "https://opensource.org/license/mit"
 
 
 Quick Jump:
-
-
 - [Why?](#why)
 - [How?](#how)
   - [Note on executing fp8 models](#note-on-executing-fp8-models)
@@ -46,10 +44,10 @@ Quick Jump:
   - [Quantization - scaling to lower precision loss \& handle large values](#quantization---scaling-to-lower-precision-loss--handle-large-values)
   - [Finer grained scale - weight block size](#finer-grained-scale---weight-block-size)
 - [Saving a quantized checkpoint](#saving-a-quantized-checkpoint)
-  - [Add the scales to `Linear` layers](#add-the-scales-to-linear-layers)
+  - [Add the scales to Linear layers](#add-the-scales-to-linear-layers)
   - [Update model config](#update-model-config)
 
-# Why?
+## Why?
 
 tl;dr:
 
@@ -67,15 +65,15 @@ Starting with NVIDIA H100 GPU, GPUs have *hardware support* for 8 bit floating p
 3. Depending on the GPU, fp8 FLOPS are just higher than `bf16` FLOPS. E.g. See [H100 specifications](https://www.nvidia.com/en-us/data-center/h100/); bfloat16 has ~2k teraFLOPS and fp8 has ~4k teraFLOPS
 
 
-# How?
+## How?
 
-## Note on executing fp8 models
+### Note on executing fp8 models
 
 When we talk about `fp8` models, we typically only are talking about the **weights being `fp8`**. The actual execution of the model is still done in `bf16`. So all the **intermediate tensors are still in `bf16`**, and it's the underlying CUDA kernels that are taking in `bf16` tensors and `fp8` weights.
 
 **fp8 models still use `bf16` kv cache by default** (since the kv cache stores kv values, which are intermediate tensors).
 
-## fp8 bit format
+### fp8 bit format
 
 There are a number of different `fp8` formats; the most common is `float8_e4m3fn`. Here are some facts about it:
 
@@ -108,7 +106,7 @@ So this leads us with two questions for quantization:
 1. `bf16` can store values between `[-3.38953e+38, +3.38953e+38]`, how do we fit that into `fp8` range of `[-448, +448]`?
 2. How do we take advantage of the distribution of values in `fp8`?
 
-## Quantization - scaling to lower precision loss & handle large values
+### Quantization - scaling to lower precision loss & handle large values
 
 Since `bf16` and `fp8` have different ranges, we need to scale the values to fit into the `fp8` range. This scale is based
 on the max value of the data at `bf16`, and is roughly computed like:
@@ -128,7 +126,7 @@ And to dequantize (which is essentially done on the fly at runtime inside the CU
 x_dequantized = x.to(torch.bfloat16) * scale
 ```
 
-## Finer grained scale - weight block size
+### Finer grained scale - weight block size
 
 Above I showed the scale being a single value, but you can also have it be a tensor. If you look at some popular open source `fp8` models they typically use this option.
 
@@ -146,11 +144,11 @@ scale = x.abs().amax(dim=[1, 3]) / 448
 assert scale.shape == torch.Size([N // n, K // k])
 ```
 
-# Saving a quantized checkpoint
+## Saving a quantized checkpoint
 
 For compatibility with things like VLLM there's a couple things we need to do:
 
-## Add the scales to `Linear` layers
+### Add the scales to Linear layers
 
 We need to add the previously computed `weight_scale` as a parameter to each of the `Linear` layers. This basically means just replace the `Linear` layer with this custom `PackedLinear` class, where `weight` is the `fp8` tensor, and `weight_scale` is the scale from previous sections.
 
@@ -162,7 +160,7 @@ class PackedLinear(torch.nn.Module):
         self.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 ```
 
-## Update model config
+### Update model config
 
 This part is really easy, just add a `quantization_config` into the model's config. This will also appear in the `config.json` file in the huggingface repo of the model.
 
