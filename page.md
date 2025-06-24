@@ -37,13 +37,7 @@ license_url: "https://opensource.org/license/mit"
 
 
 Quick Jump:
-<div>
-  <ol>
-    <li><a href="#why">Why?</a></li>
-    <li><a href="#how">How?</a></li>
-    <li><a href="#saving-a-quantized-checkpoint">Saving a quantized checkpoint</a></li>
-  </ol>
-</div>
+
 
 - [Why?](#why)
 - [How?](#how)
