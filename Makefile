@@ -5,12 +5,10 @@ TEMPLATE = template.html
 SOURCE = page.md
 OUTPUT = index.html
 CSS = style.css
-WATCH_FILES = $(SOURCE) $(TEMPLATE) $(CSS) favicon.png
-FAVICON_SIZES = favicon-16x16.png favicon-32x32.png apple-touch-icon.png apple-touch-icon-152x152.png apple-touch-icon-120x120.png mstile-144x144.png
-FAVICON_SOURCE = favicon.png
+WATCH_FILES = $(SOURCE) $(TEMPLATE) $(CSS)
 
 # Default target: build the HTML and favicons
-all: $(OUTPUT) favicons site.webmanifest
+all: $(OUTPUT) site.webmanifest
 
 # Build index.html from the Markdown source and template (without LiveReload)
 $(OUTPUT): $(SOURCE) $(TEMPLATE)
@@ -28,28 +26,6 @@ $(OUTPUT).livereload: $(SOURCE) $(TEMPLATE)
 	  --output=$(OUTPUT) \
 	  --variable=livereload:true
 	@touch $(OUTPUT).livereload
-
-# Generate all favicon sizes
-favicons: $(FAVICON_SIZES)
-
-# Generate each favicon size
-favicon-16x16.png: $(FAVICON_SOURCE)
-	convert $(FAVICON_SOURCE) -resize 16x16 $@
-
-favicon-32x32.png: $(FAVICON_SOURCE)
-	convert $(FAVICON_SOURCE) -resize 32x32 $@
-
-apple-touch-icon.png: $(FAVICON_SOURCE)
-	convert $(FAVICON_SOURCE) -resize 180x180 $@
-
-apple-touch-icon-152x152.png: $(FAVICON_SOURCE)
-	convert $(FAVICON_SOURCE) -resize 152x152 $@
-
-apple-touch-icon-120x120.png: $(FAVICON_SOURCE)
-	convert $(FAVICON_SOURCE) -resize 120x120 $@
-
-mstile-144x144.png: $(FAVICON_SOURCE)
-	convert $(FAVICON_SOURCE) -resize 144x144 $@
 
 # Generate site.webmanifest
 site.webmanifest:
