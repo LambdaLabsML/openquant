@@ -36,6 +36,7 @@ license_url: "https://opensource.org/license/mit"
 ---
 
 Table of contents:
+
 - [fp8: Why?](#fp8-why)
 - [fp8: How?](#fp8-how)
   - [Note on executing fp8 models](#note-on-executing-fp8-models)
