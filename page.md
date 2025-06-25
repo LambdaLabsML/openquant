@@ -72,6 +72,13 @@ Starting with NVIDIA H100 GPU, GPUs have *hardware support* for 8 bit floating p
 
 When we talk about `fp8` models, we typically only are talking about the **weights being `fp8`**. The actual execution of the model is still done in `bf16`. So all the **intermediate tensors are still in `bf16`**, and it's the underlying CUDA kernels that are taking in `bf16` tensors and `fp8` weights.
 
+```
+      `fp8` weight
+                \
+                 v
+`bf16` input -> Linear -> `bf16` output
+```
+
 **fp8 models still use `bf16` kv cache by default** (since the kv cache stores kv values, which are intermediate tensors).
 
 ### fp8 bit format
