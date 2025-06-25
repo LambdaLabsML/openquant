@@ -76,14 +76,25 @@ When we talk about `fp8` models, we typically only are talking about the **weigh
 
 ### fp8 bit format
 
-There are a number of different `fp8` formats; the most common is `float8_e4m3fn`. Here are some facts about it:
+There are a number of different `fp8` formats; the most common is `float8_e4m3fn`. Here are the bit patterns for the f8 and f16 formats:
+
+| Format        | Bit Pattern     | `INF` Support |
+| ------------- | --------------- | ----------- |
+| float8_e4m3fn | ⚫🟩🟩🟩🟩🟥🟥🟥        | ❌           |
+| float8_e5m2fn | ⚫🟩🟩🟩🟩🟩🟥🟥        | ❌           |
+| bfloat16      | ⚫🟩🟩🟩🟩🟩🟩🟩🟥🟥🟥🟥🟥🟥🟥 | ✅           |
+| float16       | ⚫🟩🟩🟩🟩🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | ✅           |
+
+where: ⚫ = Sign bit, 🟩 = Exponent bit, 🟥 = Mantissa (fraction) bit
+
+Here are some facts about `float8_e4m3fn`:
 
 1. This format has `1` sign bit, `4` bits for exponent (`e4`), and `3` bits for mantissa (`m3`)
 2. Values can be between `[-448, +448]`
-    1. 256 representable values
-3. Cannot represent `infinity` (the `fn` postfix stands for "finite numbers only" - there are other fp8 formats that do support infinity)
-4. Can represent `NaN`
-5. Model parameters are typically stored using this format (note that `inf` is not usually present in pretrained model parameters)
+3. There are `256` representable values
+4. `infinity` **not** supported (the `fn` postfix stands for "finite numbers only" - there are other fp8 formats that do support infinity)
+5. `NaN` supported
+6. Model parameters are typically stored using this format (note that `inf` is not usually present in pretrained model parameters)
 
 <details>
     <summary>
