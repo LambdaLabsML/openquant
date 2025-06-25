@@ -43,7 +43,7 @@ Quick Jump:
   - [Note on executing fp8 models](#note-on-executing-fp8-models)
   - [fp8 bit format](#fp8-bit-format)
   - [Quantization - scaling to lower precision loss \& handle large values](#quantization---scaling-to-lower-precision-loss--handle-large-values)
-  - [Finer grained scale - weight block size](#finer-grained-scale---weight-block-size)
+  - [Block style scale](#block-style-scale)
 - [Saving a quantized checkpoint](#saving-a-quantized-checkpoint)
   - [Add the scales to Linear layers](#add-the-scales-to-linear-layers)
   - [Update model config](#update-model-config)
@@ -127,31 +127,32 @@ So this leads us with two questions for quantization:
 
 ### Quantization - scaling to lower precision loss & handle large values
 
-Since `bf16` and `fp8` have different ranges, we need to scale the values to fit into the `fp8` range. This scale is based
-on the max value of the data at `bf16`, and is roughly computed like:
+Since `bf16` and `fp8` have different ranges, we need to scale the values to fit into the `fp8` range. This scale is based on the max value of the data at `bf16`, and is roughly computed like:
 
 ```python
 # NOTE: this will be a single value
-scale = x.abs().amax() / 448
+scale = x_bf16.abs().amax() / 448
 ```
 
 Then once we have the scale we can quantize the `bf16` tensor:
 ```python
-x_quantized = (x / scale).clamp(min=-448, max=448).to(torch.float8_e4m3fn)
+x_fp8 = (x_bf16 / scale).clamp(min=-448, max=448).to(torch.float8_e4m3fn)
 ```
+
+Note that by dividing by scale, the values should alreayd be within the range of -448 to 448, so the extra `.clamp()` operation is just to ensure this numerically.
 
 And to dequantize (which is essentially done on the fly at runtime inside the CUDA kernels), you do this (noting that you have to store the `scale` values for the forward process):
 ```python
-x_dequantized = x.to(torch.bfloat16) * scale
+x = x_fp8.to(torch.bfloat16) * scale
 ```
 
-### Finer grained scale - weight block size
+### Block style scale
 
-Above I showed the scale being a single value, but you can also have it be a tensor. If you look at some popular open source `fp8` models they typically use this option.
+Above I showed the scale being a single value, but you can also have scale applied to blocks of values in the tensor. If you look at some popular open source `fp8` models they typically use this option.
 
-Why would you do this? To theoretically preserve accuracy, though if the values in your tensor are all relatively close together you won't get much benefit.
+Why would you do this? To theoretically preserve accuracy.
 
-Given a weight_block_size of `[128, 128]`, and a tensor of shape `[N, K]`, the scale will be of size `[N // 128, K // 128]`:
+Given a `weight_block_size` of `[128, 128]`, and a tensor of shape `[N, K]`, the scale will be of size `[N // 128, K // 128]`:
 
 E.g. assuming x is 2d, we have the code:
 
