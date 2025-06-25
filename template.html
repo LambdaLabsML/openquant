@@ -139,14 +139,12 @@
                   overflowX: 'auto',
                   color: theme('colors.gray.800'),
                   border: '1px solid ' + theme('colors.gray.200'),
-                  boxShadow: '0 2px 5px rgba(0,0,0,0.03)',
-                  content: ''
+                  boxShadow: '0 2px 5px rgba(0,0,0,0.03)'
                 },
                 'pre code': {
                   backgroundColor: 'transparent',
                   border: 'none',
-                  padding: '0',
-                  content: ''
+                  padding: '0'
                 },
                 'ul > li::marker': { color: theme('colors.blue.500') },
                 'ol > li::marker': { color: theme('colors.gray.600') },
@@ -205,6 +203,12 @@
   </script>
   
   <style>
+    .prose code::before {
+      content: "";
+    }
+    .prose code::after {
+      content: "";
+    }
     .copy-button {
       position: absolute;
       top: 0.5rem;
