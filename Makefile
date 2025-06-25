@@ -13,7 +13,7 @@ all: $(OUTPUT) site.webmanifest
 # Build index.html from the Markdown source and template (without LiveReload)
 $(OUTPUT): $(SOURCE) $(TEMPLATE)
 	$(PANDOC) $(SOURCE) \
-	  --from markdown \
+	  --from markdown_strict \
 	  --template=$(TEMPLATE) \
 	  --output=$(OUTPUT) \
 	  --variable=livereload:false
@@ -21,7 +21,7 @@ $(OUTPUT): $(SOURCE) $(TEMPLATE)
 # Build with LiveReload enabled
 $(OUTPUT).livereload: $(SOURCE) $(TEMPLATE)
 	$(PANDOC) $(SOURCE) \
-	  --from markdown \
+	  --from markdown_strict \
 	  --template=$(TEMPLATE) \
 	  --output=$(OUTPUT) \
 	  --variable=livereload:true
