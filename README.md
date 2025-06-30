@@ -34,7 +34,7 @@ python compress_fp8.py -m Qwen/Qwen3-32B
 
 tl;dr:
 1. `model size * 0.5`
-2. `throughput * 1.2ish` (with a lot of caveats)
+2. `throughput * 1.2ish` (with a lot of caveats). See [our benchmarks](https://docs.google.com/spreadsheets/d/1W5KrY3fv0yPJCt8RU3EBap6_K13VY9-oURkoH6zX2sM/edit?usp=sharing)
 
 Models today are usually trained in `bf16`, which is a decimal number stored in 16 bits (2 bytes). At the billions of parameter scale, these add up VERY quickly. The main reason for quantizing a model from `bf16` to `fp8` is **memory reduction.**
 
